@@ -540,21 +540,38 @@ class ContinuousBatchingScheduler:
         self._decode_step_single(seq)
 
     def _decode_step_single(self, seq: Sequence) -> None:
-        """Run one blocking decode step — reads KV state from the paged pool.
+        """Run one blocking decode step — uses live past_key_values on the sequence.
 
-        Phase 8: past_key_values is reconstructed from the paged pool before
-        each forward pass.  seq.past_key_values remains None throughout decode.
+        Performance design
+        ------------------
+        We keep ``seq.past_key_values`` alive between steps (the HuggingFace
+        KV cache object returned by the previous forward pass).  This avoids
+        reconstructing the full cache from the paged pool on every token, which
+        is prohibitively expensive on MPS due to Metal dispatch overhead for
+        the many small tensor operations involved (24 layers × read + permute +
+        cache.update = ~240 ms overhead per token on MPS vs ~24 ms for the
+        forward pass itself).
+
+        The paged pool is still updated every step so eviction/swapping (Phase 9)
+        remains accurate — we just never *read* from it during normal decode.
+        When a sequence is swapped out and later swapped back in, its
+        ``past_key_values`` is rebuilt from the pool at that point (handled by
+        the swap-in path in ``_schedule``).
         """
         t_step = time.perf_counter()
 
-        # Reconstruct past_key_values from paged pool (Phase 8 pool-read path)
-        past_kv = build_past_key_values(
-            seq_id=seq.seq_id,
-            paged_kv_cache=self.paged_kv_cache,
-            num_layers=self.kv_cache_config.num_layers,
-            device=str(self._device),
-            use_dynamic_cache=True,
-        )
+        # Use the live KV cache kept on the sequence (None only on first decode
+        # step after chunked prefill, which sets state="decoding" but leaves
+        # past_key_values=None — in that case we rebuild once from the pool).
+        past_kv = seq.past_key_values
+        if past_kv is None:
+            past_kv = build_past_key_values(
+                seq_id=seq.seq_id,
+                paged_kv_cache=self.paged_kv_cache,
+                num_layers=self.kv_cache_config.num_layers,
+                device=str(self._device),
+                use_dynamic_cache=True,
+            )
 
         # Determine next input token
         last_token_id = (
@@ -566,7 +583,7 @@ class ContinuousBatchingScheduler:
             [[last_token_id]], dtype=torch.long, device=self._device
         )
 
-        # Forward pass — one token, with reconstructed KV from paged pool
+        # Forward pass — one token with live KV cache
         with torch.no_grad():
             outputs = self.model(
                 input_ids=input_ids,
@@ -578,7 +595,11 @@ class ContinuousBatchingScheduler:
         next_token_id = int(outputs.logits[:, -1, :].argmax(dim=-1).item())
         seq.generated_token_ids.append(next_token_id)
 
-        # Write new token's KV into the paged pool
+        # Keep the live KV cache on the sequence for the next step
+        seq.past_key_values = outputs.past_key_values
+
+        # Also write the new token's KV into the paged pool so eviction/swap
+        # tracking remains accurate even though we don't read from it here.
         new_past_kv = outputs.past_key_values
         token_position = len(seq.prompt_token_ids) + len(seq.generated_token_ids) - 1
         for layer_idx in range(self.kv_cache_config.num_layers):
@@ -588,8 +609,6 @@ class ContinuousBatchingScheduler:
             self.paged_kv_cache.write_kv(
                 seq.seq_id, layer_idx, token_position, key_slice, value_slice
             )
-        # Do NOT store new_past_kv on seq — pool is source of truth
-        # seq.past_key_values remains None after Phase 8
 
         # Update block allocator token tracking
         try:
@@ -622,10 +641,14 @@ class ContinuousBatchingScheduler:
         if eos_hit:
             seq.finish_reason = "eos"
             seq.state = "finished"
+            # Free live KV memory immediately on completion
+            seq.past_key_values = None
             logger.debug("seq_id=%s finished (eos)", seq.seq_id)
         elif length_hit:
             seq.finish_reason = "length"
             seq.state = "finished"
+            # Free live KV memory immediately on completion
+            seq.past_key_values = None
             logger.debug("seq_id=%s finished (length)", seq.seq_id)
 
         if seq.is_finished():

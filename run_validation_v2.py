@@ -87,10 +87,11 @@ async def _send_request(
 ) -> Dict[str, Any]:
     """Send one /generate request; return the JSON body with added timing."""
     t_send = time.perf_counter()
+    import httpx as _httpx
     resp = await client.post(
         f"{PHASE2_BASE_URL}/generate",
         json={"prompt": prompt, "max_new_tokens": MAX_NEW_TOKENS},
-        timeout=300.0,
+        timeout=_httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
     )
     t_recv = time.perf_counter()
 
@@ -121,7 +122,16 @@ def _load_phase1_baseline() -> Optional[float]:
     try:
         with open(BASELINE_METRICS_PATH) as fh:
             data = json.load(fh)
-        mean_ms: float = data["summary"]["total_latency_ms"]["mean"]
+        # Try summary key first (written by some versions of the validation script)
+        if "summary" in data and "total_latency_ms" in data["summary"]:
+            mean_ms: float = data["summary"]["total_latency_ms"]["mean"]
+        else:
+            # Fall back: compute mean from per-request results list
+            results_list = data.get("results", [])
+            if not results_list:
+                print("[WARN] baseline_metrics.json has no 'summary' or 'results' key")
+                return None
+            mean_ms = sum(r["total_latency_ms"] for r in results_list) / len(results_list)
         print(f"[Phase 1] Mean single-request latency: {mean_ms:.1f} ms")
         return mean_ms
     except (KeyError, TypeError, json.JSONDecodeError) as exc:
