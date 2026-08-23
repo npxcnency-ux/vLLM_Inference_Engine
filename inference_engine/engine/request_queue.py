@@ -28,10 +28,8 @@ Priority-aware scheduling is reserved for a future phase.
 Future wiring
 -------------
 Each QueuedRequest carries an asyncio.Future.  It is resolved with an
-exception on timeout or cancellation.  The scheduler will resolve it with
-the finished Sequence in a future phase; in Phase 3 the /generate endpoint
-still uses the polling loop (seq.state == "finished") and the future is
-created but not awaited by the server layer.
+exception on timeout or cancellation, or with the finished Sequence by the
+scheduler.  The server awaits this future directly.
 """
 
 from __future__ import annotations
@@ -73,7 +71,7 @@ class QueuedRequest:
         An ``asyncio.Future`` created at enqueue time.  Resolved with:
         - ``asyncio.TimeoutError`` on expiry
         - ``asyncio.CancelledError`` on explicit cancellation
-        - (future phase) the finished Sequence on successful completion
+        - the finished Sequence on successful completion
     priority
         Lower integer = higher priority.  Reserved for future use; ordering
         is NOT changed in Phase 3 — FIFO is preserved across all priorities.
@@ -139,13 +137,16 @@ class RequestQueue:
         -------
         asyncio.Future
             Resolved with TimeoutError on expiry or CancelledError on cancel.
-            In a future phase it will be resolved with the finished Sequence.
+            The scheduler resolves it with the finished Sequence on success.
 
         Raises
         ------
         QueueFullError
             If ``len(_queue) >= maxsize`` at the time of enqueue.
         """
+        # Reclaim stale capacity before rejecting a new request.
+        await self.expire_timed_out()
+
         async with self._lock:
             if len(self._queue) >= self.maxsize:
                 raise QueueFullError(self.maxsize)
@@ -174,9 +175,8 @@ class RequestQueue:
 
         Returns None if the queue is empty after expiry scanning.
 
-        Note: _total_admitted is NOT incremented here — the scheduler
-        increments it after the sequence successfully completes prefill,
-        separating "dequeued for prefill" from "prefill started".
+        Note: _total_admitted is NOT incremented here — the scheduler records
+        admission after it moves the dequeued sequence into the active batch.
         """
         # Expire stale entries before considering admission
         await self.expire_timed_out()
@@ -186,6 +186,10 @@ class RequestQueue:
                 return None
             item = self._queue.pop(0)
             return item
+
+    def mark_admitted(self) -> None:
+        """Record that one dequeued request entered the scheduler."""
+        self._total_admitted += 1
 
     # ── Expiry ────────────────────────────────────────────────────────────────
 

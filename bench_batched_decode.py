@@ -92,7 +92,7 @@ def run_one_serial(
     next_tok = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
 
     tok_ms: List[float] = []
-    for _ in range(max_tokens):
+    for _ in range(max_tokens - 1):
         out, step_ms = timed_forward(
             device,
             lambda next_tok=next_tok, past=past: model(
@@ -151,7 +151,7 @@ def bench_round_robin(model, tokenizer, device: str) -> Dict[str, Any]:
 
     sync(device)
     t0 = time.perf_counter()
-    for _ in range(MAX_TOKENS):
+    for _ in range(MAX_TOKENS - 1):
         for state in states:
             out, step_ms = timed_forward(
                 device,
@@ -168,6 +168,7 @@ def bench_round_robin(model, tokenizer, device: str) -> Dict[str, Any]:
     decode_wall_ms = (time.perf_counter() - t0) * 1000.0
 
     total_tokens = len(PROMPTS) * MAX_TOKENS
+    decode_tokens = len(PROMPTS) * (MAX_TOKENS - 1)
     end_to_end_ms = sum(prefill_ms) + decode_wall_ms
     latencies = [prefill_ms[i] + sum(states[i]["tok_ms"]) for i in range(len(states))]
     return {
@@ -175,7 +176,7 @@ def bench_round_robin(model, tokenizer, device: str) -> Dict[str, Any]:
         "decode_wall_ms": decode_wall_ms,
         "end_to_end_ms": end_to_end_ms,
         "total_tokens": total_tokens,
-        "aggregate_tps_decode_only": total_tokens / (decode_wall_ms / 1000.0),
+        "aggregate_tps_decode_only": decode_tokens / (decode_wall_ms / 1000.0),
         "aggregate_tps_end_to_end": total_tokens / (end_to_end_ms / 1000.0),
         "ttft_ms_mean": statistics.mean(prefill_ms),
         "latency_ms_mean": statistics.mean(latencies),
@@ -203,7 +204,7 @@ def bench_true_batched(model, tokenizer, device: str) -> Dict[str, Any]:
     past = out.past_key_values
 
     step_ms: List[float] = []
-    for _ in range(MAX_TOKENS):
+    for _ in range(MAX_TOKENS - 1):
         attention_mask = torch.cat(
             [attention_mask, torch.ones((attention_mask.shape[0], 1), device=device, dtype=attention_mask.dtype)],
             dim=1,
@@ -225,6 +226,7 @@ def bench_true_batched(model, tokenizer, device: str) -> Dict[str, Any]:
     end_to_end_ms = (time.perf_counter() - t0) * 1000.0
 
     total_tokens = len(PROMPTS) * MAX_TOKENS
+    decode_tokens = len(PROMPTS) * (MAX_TOKENS - 1)
     decode_ms = sum(step_ms)
     return {
         "n_requests": len(PROMPTS),
@@ -232,7 +234,7 @@ def bench_true_batched(model, tokenizer, device: str) -> Dict[str, Any]:
         "decode_wall_ms": decode_ms,
         "end_to_end_ms": end_to_end_ms,
         "total_tokens": total_tokens,
-        "aggregate_tps_decode_only": total_tokens / (decode_ms / 1000.0),
+        "aggregate_tps_decode_only": decode_tokens / (decode_ms / 1000.0),
         "aggregate_tps_end_to_end": total_tokens / (end_to_end_ms / 1000.0),
         "mean_batched_step_ms": statistics.mean(step_ms),
         "tokens_per_batched_step": len(PROMPTS),

@@ -121,6 +121,22 @@ def test_single_request_through_scheduler(loaded: LoadedModel, cfg: Config):
     asyncio.run(_run())
 
 
+def test_single_token_request_finishes_after_prefill(loaded: LoadedModel, cfg: Config):
+    """The first token sampled by prefill must count toward max_new_tokens."""
+
+    async def _run():
+        scheduler = _make_scheduler(loaded, cfg)
+        seq, _ = await scheduler.add_request(SHORT_PROMPT, max_new_tokens=1)
+
+        await scheduler._schedule()
+
+        assert seq.is_finished()
+        assert seq.finish_reason in ("eos", "length")
+        assert len(seq.generated_token_ids) == 1
+
+    asyncio.run(_run())
+
+
 # ── Test 2: multiple requests all reach decoding state ───────────────────────
 
 
@@ -252,8 +268,8 @@ def test_prefill_budget_respected(loaded: LoadedModel, cfg: Config):
     the Stage-2 chunk-processing loop respects prefill_budget_tokens.
 
     A 20-token prompt with chunk_size=128 means the chunk is 20 tokens.
-    With budget=10 (< 20), that chunk is skipped this step: the sequence stays
-    in running with state "chunked_prefilling" and prefill_offset == 0.
+    With budget=10 (< 20), the admitted chunk size is capped at 10 so the
+    request makes progress without exceeding the per-step budget.
     """
     async def _run():
         scheduler = _make_scheduler(loaded, cfg)
@@ -269,8 +285,8 @@ def test_prefill_budget_respected(loaded: LoadedModel, cfg: Config):
 
         # Sequence is admitted to running (new behaviour)
         assert seq in scheduler.running
-        # But no forward pass ran — offset is still at the start
-        assert seq.prefill_offset == 0
+        # One budget-sized chunk ran and the remainder is deferred.
+        assert seq.prefill_offset == 10
         assert seq.state == "chunked_prefilling"
 
     asyncio.run(_run())

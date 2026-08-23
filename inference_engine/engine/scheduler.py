@@ -53,7 +53,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import List, Optional, Tuple
 
 import torch
@@ -74,7 +76,7 @@ from inference_engine.engine.prefill_utils import run_prefill_single
 from inference_engine.engine.request_queue import RequestQueue
 from inference_engine.engine.sequence import Sequence
 from inference_engine.engine.stage_tracker import StageTracker
-from inference_engine.engine.sequential import get_memory_stats
+from inference_engine.engine.sequential import GenerationResult, get_memory_stats
 from inference_engine.metrics.collector import MetricsCollector
 
 logger = logging.getLogger(__name__)
@@ -197,7 +199,9 @@ class ContinuousBatchingScheduler:
             request_timeout_ms=getattr(config, "request_timeout_ms", 30_000.0),
         )
         self.running: List[Sequence] = []      # currently active sequences
-        self.finished: List[Sequence] = []     # completed sequences
+        history_size = max(1, getattr(config, "metrics_history_size", 100))
+        self.finished: deque[Sequence] = deque(maxlen=history_size)
+        self.total_finished: int = 0
         self.swapped_out: List[Sequence] = []  # Phase 9: sequences swapped to CPU
 
         # Phase 10: Unified metrics aggregator
@@ -230,9 +234,14 @@ class ContinuousBatchingScheduler:
 
         # Metrics
         # list of (timestamp: float, batch_size: int)
-        self.batch_size_over_time: List[Tuple[float, int]] = []
+        scheduler_history_size = history_size * 10
+        self.batch_size_over_time: deque[Tuple[float, int]] = deque(
+            maxlen=scheduler_history_size
+        )
         # wall-clock duration of each _schedule() call in ms
-        self.scheduler_step_latency_ms: List[float] = []
+        self.scheduler_step_latency_ms: deque[float] = deque(
+            maxlen=scheduler_history_size
+        )
 
         # Device resolved once from model parameters
         self._device: torch.device = next(model.parameters()).device
@@ -251,11 +260,10 @@ class ContinuousBatchingScheduler:
         """Tokenize *prompt*, create a Sequence in state 'waiting', enqueue it.
 
         Returns a ``(Sequence, asyncio.Future)`` tuple:
-        - Sequence: the caller's handle for polling ``seq.state == 'finished'``
-          (used by the Phase 3 server polling loop).
+        - Sequence: the caller's request handle.
         - asyncio.Future: wired to the request lifecycle; resolved with
-          TimeoutError on expiry or CancelledError on cancellation.  Will be
-          resolved with the finished Sequence in a later phase.
+          TimeoutError on expiry, CancelledError on cancellation, or the
+          finished Sequence on success.
 
         Raises QueueFullError if the RequestQueue is at capacity — propagated
         to the caller; the server layer converts it to HTTP 503.
@@ -263,11 +271,16 @@ class ContinuousBatchingScheduler:
         Tokenization runs in the shared executor to avoid blocking the event
         loop on long prompts.
         """
-        loop = asyncio.get_event_loop()
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1")
+
+        loop = asyncio.get_running_loop()
         prompt_token_ids: List[int] = await loop.run_in_executor(
             self._executor,
             lambda: self.tokenizer(prompt, add_special_tokens=True)["input_ids"],
         )
+        if not prompt_token_ids:
+            raise ValueError("The prompt produced no input tokens")
 
         seq = Sequence.create(
             prompt=prompt,
@@ -277,8 +290,38 @@ class ContinuousBatchingScheduler:
         # QueueFullError propagates to caller — do NOT catch here.
         future = await self.request_queue.enqueue(seq)
         self._futures[seq.seq_id] = future
+
+        def _forget_completed_future(done_future: asyncio.Future) -> None:
+            if self._futures.get(seq.seq_id) is done_future:
+                self._futures.pop(seq.seq_id, None)
+
+        future.add_done_callback(_forget_completed_future)
         logger.debug("Enqueued seq_id=%s prompt_len=%d", seq.seq_id, len(prompt_token_ids))
         return seq, future
+
+    def _record_first_token(self, seq: Sequence) -> None:
+        """Record the prefill token and finish immediately when appropriate."""
+        self.metrics_aggregator.record_token_generated(1)
+        eos_id = self.tokenizer.eos_token_id
+        if eos_id is not None and seq.generated_token_ids[-1] == eos_id:
+            seq.finish_reason = "eos"
+            seq.state = "finished"
+        elif len(seq.generated_token_ids) >= seq.max_new_tokens:
+            seq.finish_reason = "length"
+            seq.state = "finished"
+
+        if seq.is_finished():
+            seq.past_key_values = None
+            self.kv_tracker.unregister_sequence(seq.seq_id)
+
+    def _fail_sequence(self, seq: Sequence, exc: Exception) -> None:
+        """Move a sequence to a terminal error state without killing the loop."""
+        logger.exception("Inference failed for seq_id=%s", seq.seq_id, exc_info=exc)
+        seq.state = "finished"
+        seq.finish_reason = "error"
+        seq.error_message = str(exc)
+        seq.past_key_values = None
+        self.kv_tracker.unregister_sequence(seq.seq_id)
 
     # ── Internal: prefill ─────────────────────────────────────────────────────
 
@@ -321,15 +364,7 @@ class ContinuousBatchingScheduler:
         blocks_needed = math.ceil(prompt_token_count / self.config.kv_block_size)
         try:
             block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
-            # Mark tokens_used in the last block
-            tokens_in_last_block = prompt_token_count % self.config.kv_block_size
-            if tokens_in_last_block > 0:
-                self.block_allocator._blocks[block_ids[-1]].tokens_used = tokens_in_last_block
-                self.block_allocator._blocks[block_ids[-1]].is_dirty = True
-            else:
-                # Prompt exactly filled all blocks
-                self.block_allocator._blocks[block_ids[-1]].tokens_used = self.config.kv_block_size
-                self.block_allocator._blocks[block_ids[-1]].is_dirty = True
+            self.block_allocator.set_token_count(seq.seq_id, prompt_token_count)
         except OutOfBlocksError:
             # Phase 9: instead of killing the sequence, try to swap out the
             # largest running sequence to free device blocks, then retry.
@@ -337,21 +372,18 @@ class ContinuousBatchingScheduler:
             if not swapped_ok:
                 seq.state = "finished"
                 seq.finish_reason = "oom"
+                seq.past_key_values = None
+                self.kv_tracker.unregister_sequence(seq.seq_id)
                 return
             # Retry allocation once after swap-out freed some blocks
             try:
                 block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
-                # Mark tokens_used in the last block
-                tokens_in_last_block = prompt_token_count % self.config.kv_block_size
-                if tokens_in_last_block > 0:
-                    self.block_allocator._blocks[block_ids[-1]].tokens_used = tokens_in_last_block
-                    self.block_allocator._blocks[block_ids[-1]].is_dirty = True
-                else:
-                    self.block_allocator._blocks[block_ids[-1]].tokens_used = self.config.kv_block_size
-                    self.block_allocator._blocks[block_ids[-1]].is_dirty = True
+                self.block_allocator.set_token_count(seq.seq_id, prompt_token_count)
             except OutOfBlocksError:
                 seq.state = "finished"
                 seq.finish_reason = "oom"
+                seq.past_key_values = None
+                self.kv_tracker.unregister_sequence(seq.seq_id)
                 return
 
         # Phase 7: write prompt KV tensors into paged pool
@@ -370,6 +402,7 @@ class ContinuousBatchingScheduler:
                 )
         # Phase 8: release HuggingFace KV tensor — pool is now source of truth
         seq.past_key_values = None
+        self._record_first_token(seq)
 
         logger.debug(
             "Prefill done: seq_id=%s ttft=%.1f ms first_token=%d",
@@ -427,10 +460,7 @@ class ContinuousBatchingScheduler:
             blocks_needed = math.ceil(prompt_len / self.config.kv_block_size)
             try:
                 block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
-                tokens_in_last_block = prompt_len % self.config.kv_block_size
-                last_fill = tokens_in_last_block if tokens_in_last_block > 0 else self.config.kv_block_size
-                self.block_allocator._blocks[block_ids[-1]].tokens_used = last_fill
-                self.block_allocator._blocks[block_ids[-1]].is_dirty = True
+                self.block_allocator.set_token_count(seq.seq_id, 0)
             except OutOfBlocksError:
                 swapped_ok = self._try_swap_out_victim()
                 if not swapped_ok:
@@ -439,17 +469,14 @@ class ContinuousBatchingScheduler:
                     return
                 try:
                     block_ids = self.block_allocator.allocate(seq.seq_id, blocks_needed)
-                    tokens_in_last_block = prompt_len % self.config.kv_block_size
-                    last_fill = tokens_in_last_block if tokens_in_last_block > 0 else self.config.kv_block_size
-                    self.block_allocator._blocks[block_ids[-1]].tokens_used = last_fill
-                    self.block_allocator._blocks[block_ids[-1]].is_dirty = True
+                    self.block_allocator.set_token_count(seq.seq_id, 0)
                 except OutOfBlocksError:
                     seq.state = "finished"
                     seq.finish_reason = "oom"
                     return
 
             # Register with KV tracker using prompt length
-            self.kv_tracker.register_sequence(seq.seq_id, prompt_len)
+            self.kv_tracker.register_sequence(seq.seq_id, 0)
 
         # ── Build past_key_values from paged pool (empty on first chunk) ──────
         if is_first_chunk:
@@ -484,14 +511,23 @@ class ContinuousBatchingScheduler:
                 # We need the column corresponding to this specific prompt token.
                 # The output KV spans [prior_kv_len .. prior_kv_len + chunk_len].
                 # token_pos_in_chunk maps to that column.
-                key_slice = layer_key[0, :, token_pos_in_chunk, :]
-                val_slice = layer_val[0, :, token_pos_in_chunk, :]
+                # Model outputs contain the prior cache followed by this chunk;
+                # address the newly appended suffix, not the cache prefix.
+                source_position = token_pos_in_chunk - chunk_len
+                key_slice = layer_key[0, :, source_position, :]
+                val_slice = layer_val[0, :, source_position, :]
                 self.paged_kv_cache.write_kv(
                     seq.seq_id, layer_idx, global_pos, key_slice, val_slice
                 )
 
         # ── Advance offset ────────────────────────────────────────────────────
         seq.prefill_offset = chunk_end
+        self.block_allocator.set_token_count(seq.seq_id, chunk_end)
+        self.kv_tracker.update_sequence(seq.seq_id, chunk_end)
+        seq.update_kv_stats(
+            token_count=chunk_end,
+            memory_mb=self.kv_tracker.sequence_memory_mb(seq.seq_id),
+        )
 
         # ── If this was the last chunk, sample first token & transition ───────
         if is_last_chunk:
@@ -502,10 +538,7 @@ class ContinuousBatchingScheduler:
             seq.ttft_ms = (time.perf_counter() - seq.prefill_start_time) * 1000.0
             seq.first_token_time = time.perf_counter()
             seq.state = "decoding"
-            seq.update_kv_stats(
-                token_count=prompt_len,
-                memory_mb=self.kv_tracker.sequence_memory_mb(seq.seq_id),
-            )
+            self._record_first_token(seq)
             logger.debug(
                 "Chunked prefill done: seq_id=%s chunks=%d ttft=%.1f ms first_token=%d",
                 seq.seq_id,
@@ -573,6 +606,26 @@ class ContinuousBatchingScheduler:
                 use_dynamic_cache=True,
             )
 
+        # The decode input token is the newest generated token.  Reconstruct
+        # the existing cache first, then reserve its new slot so an unwritten
+        # slot is never included in past_key_values.
+        token_position = len(seq.prompt_token_ids) + len(seq.generated_token_ids) - 1
+        try:
+            self.block_allocator.write_token(seq.seq_id, count=1)
+        except OutOfBlocksError:
+            swapped_ok = self._try_swap_out_victim(exclude_seq_id=seq.seq_id)
+            if swapped_ok:
+                try:
+                    self.block_allocator.write_token(seq.seq_id, count=1)
+                except OutOfBlocksError:
+                    swapped_ok = False
+            if not swapped_ok:
+                seq.state = "finished"
+                seq.finish_reason = "oom"
+                seq.past_key_values = None
+                self.kv_tracker.unregister_sequence(seq.seq_id)
+                return
+
         # Determine next input token
         last_token_id = (
             seq.generated_token_ids[-1]
@@ -601,7 +654,6 @@ class ContinuousBatchingScheduler:
         # Also write the new token's KV into the paged pool so eviction/swap
         # tracking remains accurate even though we don't read from it here.
         new_past_kv = outputs.past_key_values
-        token_position = len(seq.prompt_token_ids) + len(seq.generated_token_ids) - 1
         for layer_idx in range(self.kv_cache_config.num_layers):
             key_slice, value_slice = extract_new_token_kv(
                 new_past_kv, layer_idx, token_position
@@ -610,19 +662,11 @@ class ContinuousBatchingScheduler:
                 seq.seq_id, layer_idx, token_position, key_slice, value_slice
             )
 
-        # Update block allocator token tracking
-        try:
-            self.block_allocator.write_token(seq.seq_id, count=1)
-        except OutOfBlocksError:
-            seq.state = "finished"
-            seq.finish_reason = "oom"
-            return
-
         # Update KV tracker
-        total_tokens = len(seq.prompt_token_ids) + len(seq.generated_token_ids)
-        self.kv_tracker.update_sequence(seq.seq_id, total_tokens)
+        cached_tokens = token_position + 1
+        self.kv_tracker.update_sequence(seq.seq_id, cached_tokens)
         seq.update_kv_stats(
-            token_count=total_tokens,
+            token_count=cached_tokens,
             memory_mb=self.kv_tracker.sequence_memory_mb(seq.seq_id),
         )
 
@@ -680,19 +724,53 @@ class ContinuousBatchingScheduler:
 
     def _resolve_sequence_future(self, seq: Sequence) -> None:
         """Resolve the lifecycle future associated with a finished sequence."""
-        future = self._futures.get(seq.seq_id)
+        seq.finish_time = seq.finish_time or time.perf_counter()
+        self.total_finished += 1
+        total_latency_ms = (seq.finish_time - seq.arrival_time) * 1000.0
+        generated_tokens = len(seq.generated_token_ids)
+        future = self._futures.pop(seq.seq_id, None)
         if future is not None and not future.done():
             future.set_result(seq)
+
+        try:
+            allocated_mb, reserved_mb = get_memory_stats(str(self._device))
+            self._metrics_collector.append(
+                GenerationResult(
+                    prompt=seq.prompt,
+                    generated_text=self.tokenizer.decode(
+                        seq.generated_token_ids, skip_special_tokens=True
+                    ),
+                    prompt_tokens=len(seq.prompt_token_ids),
+                    generated_tokens=generated_tokens,
+                    ttft_ms=seq.ttft_ms,
+                    total_latency_ms=total_latency_ms,
+                    tokens_per_second=(
+                        generated_tokens / total_latency_ms * 1000.0
+                        if total_latency_ms > 0 else 0.0
+                    ),
+                    per_token_latencies_ms=list(seq.per_token_latencies_ms),
+                    gpu_memory_allocated_mb=allocated_mb,
+                    gpu_memory_reserved_mb=reserved_mb,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+            )
+        except Exception:
+            logger.exception("Failed to record metrics for seq_id=%s", seq.seq_id)
+
         # Phase 10: record completion for throughput and SLO tracking
         self.metrics_aggregator.record_request_finished(seq.finish_reason)
         # Phase 7: zero paged pool slots before releasing blocks
-        self.paged_kv_cache.clear_sequence(seq.seq_id)
-        # Phase 6: release block allocator memory for this sequence
-        self.block_allocator.free(seq.seq_id)
+        try:
+            self.paged_kv_cache.clear_sequence(seq.seq_id)
+        except Exception:
+            logger.exception("Failed to clear KV cache for seq_id=%s", seq.seq_id)
+        finally:
+            # Phase 6: release block allocator memory for this sequence
+            self.block_allocator.free(seq.seq_id)
 
     # ── Internal: Phase 9 swap helpers ────────────────────────────────────────
 
-    def _try_swap_out_victim(self) -> bool:
+    def _try_swap_out_victim(self, exclude_seq_id: Optional[str] = None) -> bool:
         """Find the largest running sequence and swap its KV blocks to CPU.
 
         Selection policy: largest by block count (most device memory freed per
@@ -705,12 +783,19 @@ class ContinuousBatchingScheduler:
             True if a victim was successfully swapped out; False if no
             candidates exist or the CPU pool is full.
         """
-        if not self.running:
+        candidates = [
+            sequence
+            for sequence in self.running
+            if sequence.state == "decoding"
+            and sequence.seq_id != exclude_seq_id
+            and self.block_allocator.num_blocks_for_seq(sequence.seq_id) > 0
+        ]
+        if not candidates:
             return False
 
         # Pick the sequence holding the most device blocks
         victim = max(
-            self.running,
+            candidates,
             key=lambda s: self.block_allocator.num_blocks_for_seq(s.seq_id),
         )
 
@@ -730,6 +815,7 @@ class ContinuousBatchingScheduler:
             return False
 
         # Transition victim to 'swapped' state and move it out of running
+        victim.past_key_values = None
         victim.state = "swapped"
         self.running.remove(victim)
         self.swapped_out.append(victim)
@@ -768,12 +854,18 @@ class ContinuousBatchingScheduler:
         one chunk forward pass rather than the full prompt forward pass.
         """
         step_start = time.perf_counter()
+        running_limit = min(self.max_batch_size, self.decode_batch_limit)
+
+        # Timeouts must progress even while the active batch is full.
+        await self.request_queue.expire_timed_out()
 
         # --- Phase 9: Swap-in check ---
         # Before admitting new sequences, try to restore any swapped-out
         # sequences if the device pool now has enough room.
         for victim in list(self.swapped_out):
-            swap_record = self.cpu_swap_manager._swapped.get(victim.seq_id)
+            if len(self.running) >= running_limit:
+                break
+            swap_record = self.cpu_swap_manager.get_swapped_sequence(victim.seq_id)
             if swap_record is None:
                 # Already cleaned up — remove from list
                 self.swapped_out.remove(victim)
@@ -799,7 +891,6 @@ class ContinuousBatchingScheduler:
         # The actual forward pass happens in Stage 2 below.
         admit_start = time.perf_counter()
         sequences_admitted = 0
-        running_limit = min(self.max_batch_size, self.decode_batch_limit)
 
         while len(self.running) < running_limit:
             queued = await self.request_queue.dequeue()
@@ -807,10 +898,12 @@ class ContinuousBatchingScheduler:
                 break
             seq = queued.sequence
             # Stamp the chunk size from config (frozen for this sequence's lifetime)
-            seq.prefill_chunk_size = self.config.prefill_chunk_size
+            seq.prefill_chunk_size = min(
+                self.config.prefill_chunk_size, self.prefill_budget_tokens
+            )
             seq.state = "chunked_prefilling"
             self.running.append(seq)
-            self.request_queue._total_admitted += 1
+            self.request_queue.mark_admitted()
             sequences_admitted += 1
 
         # --- Stage 2: Advance chunked prefill for in-progress sequences ---
@@ -826,9 +919,13 @@ class ContinuousBatchingScheduler:
             if tokens_this_iteration + chunk_tokens > self.prefill_budget_tokens:
                 # Budget exhausted — this sequence will get its chunk next step.
                 break
-            tokens_this_iteration += chunk_tokens
-            await asyncio.to_thread(self._prefill_chunk_blocking, seq)
-            if seq.state == "decoding":
+            offset_before = seq.prefill_offset
+            try:
+                await asyncio.to_thread(self._prefill_chunk_blocking, seq)
+                tokens_this_iteration += seq.prefill_offset - offset_before
+            except Exception as exc:
+                self._fail_sequence(seq, exc)
+            if seq.is_prefill_done() and seq.generated_token_ids:
                 sequences_prefilled += 1  # last chunk completed
             elif seq.state == "finished":
                 # OOM during chunk allocation — will be evicted in Stage 3
@@ -846,10 +943,19 @@ class ContinuousBatchingScheduler:
         decode_start = time.perf_counter()
         sequences_decoded = 0
         still_running: List[Sequence] = []
-        for seq in self.running:
+        for seq in list(self.running):
+            if seq.state == "swapped":
+                continue
             if seq.state == "decoding":
-                await asyncio.to_thread(self._decode_step_single, seq)
-                sequences_decoded += 1
+                generated_before = len(seq.generated_token_ids)
+                try:
+                    await asyncio.to_thread(self._decode_step_single, seq)
+                    if len(seq.generated_token_ids) > generated_before:
+                        sequences_decoded += 1
+                except Exception as exc:
+                    self._fail_sequence(seq, exc)
+            if seq.state == "swapped":
+                continue
             if not seq.is_finished():
                 still_running.append(seq)
             else:
@@ -875,14 +981,17 @@ class ContinuousBatchingScheduler:
 
         Idle sleep interval is ``scheduler_poll_interval_ms / 1000`` seconds
         (default 0.001 s = 1 ms) when both the waiting queue and running list
-        are empty.  This is separate from the 5 ms polling in app_v2.py's
-        /generate handler.
+        are empty.
         """
         idle_sleep_s = self.config.scheduler_poll_interval_ms / 1000.0
         logger.info("Scheduler run_loop started (idle_sleep=%.3f s)", idle_sleep_s)
 
         while not self._stop_event.is_set():
-            if not self.running and len(self.request_queue) == 0:
+            if (
+                not self.running
+                and not self.swapped_out
+                and len(self.request_queue) == 0
+            ):
                 await asyncio.sleep(idle_sleep_s)
                 continue
             await self._schedule()
@@ -895,6 +1004,10 @@ class ContinuousBatchingScheduler:
         Must be called from within a running event loop (e.g. inside a FastAPI
         lifespan context).
         """
+        if self._stop_event.is_set():
+            raise RuntimeError("A stopped scheduler cannot be restarted")
+        if self._loop_task is not None and not self._loop_task.done():
+            raise RuntimeError("Scheduler is already running")
         self._loop_task = asyncio.create_task(self.run_loop(), name="scheduler_loop")
 
     async def stop(self) -> None:
@@ -906,8 +1019,16 @@ class ContinuousBatchingScheduler:
             except asyncio.TimeoutError:
                 logger.warning("Scheduler loop did not stop within 5 s; cancelling.")
                 self._loop_task.cancel()
+                try:
+                    await self._loop_task
+                except asyncio.CancelledError:
+                    pass
+        for future in list(self._futures.values()):
+            if not future.done():
+                future.cancel()
+        self._futures.clear()
         self._executor.shutdown(wait=False)
-        logger.info("Scheduler stopped. Finished %d sequences.", len(self.finished))
+        logger.info("Scheduler stopped. Finished %d sequences.", self.total_finished)
 
     # ── Public metrics API (Phase 10) ─────────────────────────────────────────
 
@@ -918,7 +1039,25 @@ class ContinuousBatchingScheduler:
         All tracker stats, derived throughput, SLO compliance, and latency
         percentiles are assembled inside MetricsAggregator.full_report().
         """
-        return self.metrics_aggregator.full_report(
-            requests_in_flight=len(self.running),
+        report = self.metrics_aggregator.full_report(
+            requests_in_flight=len(self.running) + len(self.swapped_out),
             requests_waiting=len(self.request_queue),
         )
+        report["summary"] = self._metrics_collector.compute_summary()
+        report["scheduler"] = {
+            "batch_size_over_time": list(self.batch_size_over_time),
+            "scheduler_step_latency_ms": list(self.scheduler_step_latency_ms),
+        }
+        report["sequences"] = [
+            {
+                "seq_id": seq.seq_id,
+                "state": seq.state,
+                "finish_reason": seq.finish_reason,
+                "prompt_tokens": len(seq.prompt_token_ids),
+                "generated_tokens": len(seq.generated_token_ids),
+                "ttft_ms": seq.ttft_ms,
+                "queue_wait_time_ms": seq.queue_wait_time_ms,
+            }
+            for seq in self.finished
+        ]
+        return report

@@ -59,7 +59,7 @@ def bench_single_request(model, tokenizer, device, prompt: str, max_tokens: int)
 
     # Decode steps
     for _ in range(max_tokens - 1):
-        if eos_id and next_tok_id == eos_id:
+        if eos_id is not None and next_tok_id == eos_id:
             break
         t0 = time.perf_counter()
         next_input = torch.tensor([[next_tok_id]], device=device)
@@ -116,30 +116,29 @@ def run_benchmark(model, tokenizer, device) -> dict:
     print(f"\n  Simulating {N_CONCURRENT}-way concurrent decode ({MAX_TOKENS} tokens each) …", flush=True)
 
     # Prefill all prompts first
+    t_wall_start = time.perf_counter()
     states = []
     for p in PROMPTS:
         ids = tokenizer(p, return_tensors="pt").input_ids.to(device)
-        t0 = time.perf_counter()
         with torch.no_grad():
             out = model(ids, use_cache=True)
-        ttft = (time.perf_counter() - t0) * 1000.0
+        first_token = int(out.logits[0, -1].argmax())
         states.append({
             "past": out.past_key_values,
-            "next": int(out.logits[0, -1].argmax()),
-            "generated": [],
-            "ttft_ms": ttft,
+            "next": first_token,
+            "generated": [first_token],
+            "ttft_ms": (time.perf_counter() - t_wall_start) * 1000.0,
             "per_tok_ms": [],
         })
 
     eos_id = tokenizer.eos_token_id
-    t_wall_start = time.perf_counter()
 
     # Round-robin decode until all sequences finish
     max_steps = MAX_TOKENS * N_CONCURRENT * 2  # safety cap
     step = 0
     while step < max_steps:
         active = [s for s in states if len(s["generated"]) < MAX_TOKENS
-                  and not (eos_id and s["generated"] and s["generated"][-1] == eos_id)]
+                  and not (eos_id is not None and s["generated"][-1] == eos_id)]
         if not active:
             break
         for s in active:

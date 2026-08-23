@@ -129,7 +129,7 @@ class PagedKVCacheManager:
         val_slices: list[torch.Tensor] = []
 
         for bid in block_ids:
-            tokens_used = self.block_allocator._blocks[bid].tokens_used
+            tokens_used = self.block_allocator.get_block(bid).tokens_used
             if tokens_used <= 0:
                 continue
             # key_pool[bid, :tokens_used, layer_idx] → [tokens_used, num_kv_heads, head_dim]

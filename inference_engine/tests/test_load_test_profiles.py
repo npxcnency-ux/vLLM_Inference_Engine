@@ -82,11 +82,11 @@ def test_ramp_load_increasing_density() -> None:
             f"t[{i}]={times[i]:.4f} < t[{i-1}]={times[i-1]:.4f}"
         )
 
-    # The last send time must be within a reasonable bound
-    # (sanity check: should not exceed first + 25s for 20 requests ramping 1→10 rps)
-    assert times[-1] < times[0] + 25.0, (
-        f"Last timestamp {times[-1]:.2f} s too far from first {times[0]:.2f} s"
-    )
+    # The configured duration is an actual schedule bound.
+    assert times[-1] < 20.0
+
+    # Increasing rate means later gaps are smaller than early gaps.
+    assert times[-1] - times[-2] < times[1] - times[0]
 
 
 # ── Test 4: burst_load groups share timestamp ─────────────────────────────────

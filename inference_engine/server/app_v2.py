@@ -6,7 +6,7 @@ Differences from Phase 1 (app.py)
 * No inference_lock, no single-request serialisation.
 * On startup a ContinuousBatchingScheduler is created and its run_loop() is
   started as a background asyncio Task.
-* POST /generate submits a request to the scheduler and polls for completion.
+* POST /generate submits a request and awaits its lifecycle future.
 * GET /metrics exposes scheduler-level telemetry (batch_size_over_time,
   scheduler_step_latency_ms, per-sequence stats) in addition to the per-
   request summary statistics from Phase 1.
@@ -14,18 +14,11 @@ Differences from Phase 1 (app.py)
 * Runs on port 8001 so Phase 1 (port 8000) and Phase 2 can run side-by-side
   for direct comparison.
 
-Polling design (known limitation)
------------------------------------
-The /generate handler uses:
-
-    while seq.state != "finished":
-        await asyncio.sleep(POLL_INTERVAL_S)
-
-This is a busy-wait with a configurable 5 ms sleep.  It is an intentional
-Phase 2 simplification.  The correct production alternative — an asyncio.Event
-per Sequence that the scheduler sets on completion — is deferred to a later
-phase.  The 5 ms sleep keeps CPU utilisation minimal while not adding
-noticeable latency relative to typical generation times.
+Completion signalling
+---------------------
+The /generate handler awaits the lifecycle future created by RequestQueue.
+Successful generation resolves it with the finished Sequence; queue expiry
+resolves it with TimeoutError.
 
 Endpoints
 ---------
@@ -37,12 +30,11 @@ GET  /health        Liveness check with current batch occupancy.
 from __future__ import annotations
 
 import asyncio
-import dataclasses
 import logging
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -65,10 +57,6 @@ logger = logging.getLogger(__name__)
 _config: Optional[Config] = None
 _loaded_model: Optional[LoadedModel] = None
 _scheduler: Optional[ContinuousBatchingScheduler] = None
-
-# Polling interval for /generate completion checks (5 ms)
-_GENERATE_POLL_INTERVAL_S = 0.005
-
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
 
@@ -111,7 +99,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Phase 2 server shutting down …")
     await _scheduler.stop()
-    logger.info("Scheduler stopped. %d sequences finished.", len(_scheduler.finished))
+    logger.info("Scheduler stopped. %d sequences finished.", _scheduler.total_finished)
 
 
 # ── App ───────────────────────────────────────────────────────────────────────
@@ -150,14 +138,8 @@ def _sequence_to_result_dict(seq: Sequence, device: str) -> dict:
             seq.generated_token_ids, skip_special_tokens=True
         )
 
-    total_ms = (
-        (seq.per_token_latencies_ms[-1] if seq.per_token_latencies_ms else 0.0)
-        + seq.ttft_ms
-        + sum(seq.per_token_latencies_ms)
-    )
-    # More precise: wall clock from arrival to last token
-    # Use ttft + sum(per_token) as a lower bound
-    total_latency_ms = seq.ttft_ms + sum(seq.per_token_latencies_ms)
+    finish_time = seq.finish_time or time.perf_counter()
+    total_latency_ms = (finish_time - seq.arrival_time) * 1000.0
     n_gen = len(seq.generated_token_ids)
     tps = (n_gen / total_latency_ms * 1000.0) if total_latency_ms > 0 else 0.0
 
@@ -188,19 +170,14 @@ def _sequence_to_result_dict(seq: Sequence, device: str) -> dict:
 async def endpoint_generate(request: GenerateRequest):
     """Submit *prompt* to the continuous batching scheduler.
 
-    The handler polls seq.state every 5 ms until the scheduler marks it
-    'finished'.  This polling is a known Phase 2/3 limitation.
-
-    Phase 3 additions:
-    - QueueFullError → HTTP 503 (server at capacity)
-    - The asyncio.Future returned by add_request is wired but not awaited;
-      full future-based completion signalling is deferred to a later phase.
+    The request lifecycle future resolves on completion and raises when a
+    queued request expires, so terminal states cannot leave the handler stuck.
     """
     if _scheduler is None or _loaded_model is None:
         raise HTTPException(status_code=503, detail="Scheduler not ready")
 
     try:
-        seq, _future = await _scheduler.add_request(
+        seq, future = await _scheduler.add_request(
             prompt=request.prompt,
             max_new_tokens=request.max_new_tokens,
         )
@@ -211,11 +188,21 @@ async def endpoint_generate(request: GenerateRequest):
         )
     except Exception as exc:
         logger.exception("Failed to enqueue request: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail="Failed to enqueue request") from exc
 
-    # Busy-wait poll — known Phase 3 limitation (future is wired but unused)
-    while not seq.is_finished():
-        await asyncio.sleep(_GENERATE_POLL_INTERVAL_S)
+    try:
+        seq = await future
+    except asyncio.TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Request timed out in queue") from exc
+    except asyncio.CancelledError:
+        await _scheduler.request_queue.cancel(seq.seq_id)
+        raise
+
+    if seq.finish_reason == "oom":
+        raise HTTPException(status_code=503, detail="Insufficient KV-cache capacity")
+    if seq.finish_reason == "error":
+        logger.error("Generation failed for seq_id=%s: %s", seq.seq_id, seq.error_message)
+        raise HTTPException(status_code=500, detail="Generation failed")
 
     return JSONResponse(
         content=_sequence_to_result_dict(seq, _loaded_model.device)
@@ -259,5 +246,5 @@ async def endpoint_health():
         "max_batch_size": _config.max_batch_size,
         "current_batch_size": len(_scheduler.running),
         "queue_depth": _scheduler.request_queue.stats()["queue_depth"],
-        "sequences_finished": len(_scheduler.finished),
+        "sequences_finished": _scheduler.total_finished,
     })

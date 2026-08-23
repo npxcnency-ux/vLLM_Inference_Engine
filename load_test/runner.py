@@ -52,8 +52,7 @@ class RequestResult:
     sent_at
         ``time.time()`` wall-clock timestamp when the request was dispatched.
     completed_at
-        ``time.time()`` when the response (or error) was received; None
-        on network-level exception.
+        ``time.time()`` when the response or terminal error was received.
     """
 
     request_id: str
@@ -91,6 +90,11 @@ class LoadTestRunner:
         max_concurrent: int = 50,
         request_timeout_s: float = 120.0,
     ) -> None:
+        if max_concurrent <= 0:
+            raise ValueError("max_concurrent must be greater than zero")
+        if request_timeout_s <= 0:
+            raise ValueError("request_timeout_s must be greater than zero")
+
         self.base_url = base_url.rstrip("/")
         self.max_concurrent = max_concurrent
         self.request_timeout_s = request_timeout_s
@@ -124,12 +128,15 @@ class LoadTestRunner:
 
                 if response.status_code == 200:
                     body = response.json()
+                    reported_latency = body.get("total_latency_ms")
                     return RequestResult(
                         request_id=load_req.request_id,
                         success=True,
                         status_code=200,
                         ttft_ms=body.get("ttft_ms"),
-                        total_latency_ms=body.get("total_latency_ms", elapsed_ms),
+                        total_latency_ms=(
+                            elapsed_ms if reported_latency is None else reported_latency
+                        ),
                         tokens_generated=body.get("generated_tokens"),
                         error=None,
                         sent_at=sent_at,
@@ -188,7 +195,7 @@ class LoadTestRunner:
         Returns
         -------
         list[RequestResult]
-            One result per load request, in the order they completed.
+            One result per load request, in input schedule order.
         """
         async with httpx.AsyncClient() as client:
             self._client = client

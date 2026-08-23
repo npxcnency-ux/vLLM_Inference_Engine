@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-run_validation.py — Sends 5 sequential requests to the inference server
-and produces a summary table + baseline_metrics.json.
+run_validation.py — Sends 5 concurrent requests to the sequential server and
+produces a summary table + baseline_metrics.json.
 
-Wall-clock timestamps are recorded per request to verify that requests
-are truly sequential: request N+1 must start only after request N finishes.
+Server-side inference windows are estimated from response completion time and
+reported generation latency to verify that the lock serialized concurrent work.
 
 Usage
 -----
@@ -23,6 +23,7 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import List
 
@@ -134,17 +135,22 @@ def send_request(client: httpx.Client, base_url: str, idx: int) -> RequestRecord
 
 def verify_sequential(records: List[RequestRecord]) -> bool:
     """
-    Assert that each request started AFTER the previous one finished.
+    Check that estimated server-side inference windows do not overlap.
 
-    A small grace of 10 ms is allowed for networking / scheduling jitter.
+    A small grace is allowed for response serialization and network jitter.
     Returns True if all checks pass, False otherwise.
     """
-    GRACE_S = 0.010  # 10 ms
+    GRACE_S = 0.050
+    ordered = sorted(
+        records,
+        key=lambda record: record.wall_end - record.total_latency_ms / 1000.0,
+    )
     passed = True
-    for i in range(1, len(records)):
-        prev = records[i - 1]
-        curr = records[i]
-        gap = curr.wall_start - prev.wall_end
+    for i in range(1, len(ordered)):
+        prev = ordered[i - 1]
+        curr = ordered[i]
+        curr_inference_start = curr.wall_end - curr.total_latency_ms / 1000.0
+        gap = curr_inference_start - prev.wall_end
         ok = gap >= -GRACE_S
         status = "✓" if ok else "✗"
         print(
@@ -204,14 +210,19 @@ def print_summary_table(records: List[RequestRecord]) -> None:
 
 def save_results(records: List[RequestRecord], output_path: str) -> None:
     """Save raw results and wall-clock log to JSON."""
+    ordered = sorted(
+        records,
+        key=lambda record: record.wall_end - record.total_latency_ms / 1000.0,
+    )
     wall_log = []
-    for i in range(len(records) - 1):
-        gap_ms = (records[i + 1].wall_start - records[i].wall_end) * 1000
+    for i in range(len(ordered) - 1):
+        next_start = ordered[i + 1].wall_end - ordered[i + 1].total_latency_ms / 1000.0
+        gap_ms = (next_start - ordered[i].wall_end) * 1000
         wall_log.append({
-            "from_request": records[i].request_index,
-            "to_request": records[i + 1].request_index,
+            "from_request": ordered[i].request_index,
+            "to_request": ordered[i + 1].request_index,
             "gap_between_ms": round(gap_ms, 3),
-            "sequential": gap_ms >= -10,  # 10 ms grace
+            "sequential": gap_ms >= -50,
         })
 
     payload = {
@@ -259,9 +270,13 @@ def main() -> None:
 
     records: List[RequestRecord] = []
     with httpx.Client() as client:
-        for i in range(1, NUM_REQUESTS + 1):
-            record = send_request(client, base_url, i)
-            records.append(record)
+        with ThreadPoolExecutor(max_workers=NUM_REQUESTS) as executor:
+            futures = [
+                executor.submit(send_request, client, base_url, i)
+                for i in range(1, NUM_REQUESTS + 1)
+            ]
+            records = [future.result() for future in futures]
+    records.sort(key=lambda record: record.request_index)
 
     print_summary_table(records)
 

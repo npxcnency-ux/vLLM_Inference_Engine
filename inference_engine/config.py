@@ -23,7 +23,8 @@ def _auto_detect_device() -> str:
 
         if torch.cuda.is_available():
             return "cuda"
-        if torch.backends.mps.is_available():
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
             return "mps"
     except ImportError:
         pass
@@ -59,8 +60,7 @@ class Config:
     # Maximum number of sequences processed concurrently by the scheduler.
     max_batch_size: int = 4
     # Sleep interval (ms) for the scheduler idle loop when both the waiting
-    # queue and running list are empty.  Also used as the /generate poll
-    # interval when awaiting sequence completion (app_v2.py uses 5× this).
+    # queue and running list are empty.
     scheduler_poll_interval_ms: float = 1.0
     # Maximum time (ms) a request may wait in the RequestQueue before being
     # expired with asyncio.TimeoutError.  Applies only to Phase 3+ queue.
@@ -126,6 +126,35 @@ class Config:
         # Phase 9 env overrides
         if env_cpu_blocks := os.environ.get("KV_NUM_CPU_BLOCKS"):
             self.kv_num_cpu_blocks = int(env_cpu_blocks)
+
+        positive_int_fields = (
+            "max_new_tokens",
+            "metrics_history_size",
+            "max_batch_size",
+            "prefill_budget_tokens",
+            "decode_batch_limit",
+            "prefill_chunk_size",
+            "kv_block_size",
+            "kv_num_blocks",
+            "kv_num_cpu_blocks",
+        )
+        for field_name in positive_int_fields:
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"{field_name} must be greater than zero")
+
+        positive_float_fields = (
+            "scheduler_poll_interval_ms",
+            "request_timeout_ms",
+            "kv_cache_max_memory_mb",
+        )
+        for field_name in positive_float_fields:
+            if getattr(self, field_name) <= 0:
+                raise ValueError(f"{field_name} must be greater than zero")
+
+        if not 1 <= self.port <= 65_535:
+            raise ValueError("port must be between 1 and 65535")
+        if self.device not in {"cpu", "cuda", "mps"}:
+            raise ValueError("device must be one of: cpu, cuda, mps")
 
 
 # Module-level singleton — import and use directly when you don't need

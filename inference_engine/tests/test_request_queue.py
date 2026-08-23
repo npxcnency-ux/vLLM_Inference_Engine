@@ -99,6 +99,24 @@ async def test_queue_full_raises():
     assert "2" in str(exc_info.value)
 
 
+@pytest.mark.asyncio
+async def test_enqueue_reclaims_expired_capacity():
+    """A stale full queue must expire old entries before rejecting new work."""
+    queue = RequestQueue(maxsize=1, request_timeout_ms=1.0)
+    stale = make_sequence("stale")
+    stale_future = await queue.enqueue(stale)
+    await asyncio.sleep(0.01)
+
+    fresh = make_sequence("fresh")
+    await queue.enqueue(fresh)
+
+    assert stale.state == "expired"
+    assert stale_future.done()
+    with pytest.raises(asyncio.TimeoutError):
+        stale_future.result()
+    assert len(queue) == 1
+
+
 # ── Test 3: timeout expiry ────────────────────────────────────────────────────
 
 
@@ -205,7 +223,7 @@ async def test_stats_accuracy():
     )
 
     # Simulate scheduler incrementing admitted after prefill
-    queue._total_admitted += 1
+    queue.mark_admitted()
     s2 = queue.stats()
     assert s2["total_admitted"] == 1, (
         f"After manual increment, total_admitted should be 1, got {s2['total_admitted']}"

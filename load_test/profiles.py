@@ -68,6 +68,15 @@ def constant_load(
     -------
     list[LoadRequest] sorted by scheduled_send_time.
     """
+    if num_requests < 0:
+        raise ValueError("num_requests must be non-negative")
+    if requests_per_second <= 0:
+        raise ValueError("requests_per_second must be greater than zero")
+    if num_requests and not prompts:
+        raise ValueError("prompts must not be empty")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be greater than zero")
+
     requests: list[LoadRequest] = []
     n_prompts = len(prompts)
     for i in range(num_requests):
@@ -95,14 +104,8 @@ def ramp_load(
     The request rate interpolates from start_rps to end_rps over
     duration_seconds.  Higher rate → denser request spacing toward the end.
 
-    Algorithm
-    ---------
-    For each request i (0-indexed):
-      fraction = i / num_requests
-      avg_rps_so_far = start_rps + (end_rps - start_rps) * fraction / 2
-      scheduled_send_time = i / max(avg_rps_so_far, 0.01)
-
-    This piecewise approximation is accurate enough for benchmarking purposes.
+    The schedule inverts the cumulative integral of the linear rate curve,
+    then scales it to ``duration_seconds``.
 
     Parameters
     ----------
@@ -113,8 +116,7 @@ def ramp_load(
     end_rps:
         Final request rate (requests per second).
     duration_seconds:
-        Target total test duration (used for documentation; the schedule
-        emerges from the ramp formula, not clamped to this value).
+        Target total test duration.
     prompts:
         Pool of prompts; cycled with modulo.
     max_new_tokens:
@@ -124,12 +126,33 @@ def ramp_load(
     -------
     list[LoadRequest] in non-decreasing scheduled_send_time order.
     """
+    if num_requests < 0:
+        raise ValueError("num_requests must be non-negative")
+    if start_rps <= 0 or end_rps <= 0:
+        raise ValueError("start_rps and end_rps must be greater than zero")
+    if duration_seconds <= 0:
+        raise ValueError("duration_seconds must be greater than zero")
+    if num_requests and not prompts:
+        raise ValueError("prompts must not be empty")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be greater than zero")
+
     requests: list[LoadRequest] = []
     n_prompts = len(prompts)
+    rate_delta = end_rps - start_rps
+    average_rate = (start_rps + end_rps) / 2.0
     for i in range(num_requests):
         fraction = i / max(num_requests, 1)
-        avg_rps_so_far = start_rps + (end_rps - start_rps) * fraction / 2
-        scheduled_send_time = i / max(avg_rps_so_far, 0.01)
+        if abs(rate_delta) < 1e-12:
+            normalized_time = fraction
+        else:
+            discriminant = (
+                start_rps ** 2 + 2.0 * rate_delta * fraction * average_rate
+            )
+            normalized_time = (
+                -start_rps + max(discriminant, 0.0) ** 0.5
+            ) / rate_delta
+        scheduled_send_time = normalized_time * duration_seconds
         requests.append(
             LoadRequest(
                 request_id=uuid.uuid4().hex,
@@ -172,6 +195,15 @@ def burst_load(
     -------
     list[LoadRequest] ordered by burst index.
     """
+    if num_bursts < 0 or requests_per_burst < 0:
+        raise ValueError("burst counts must be non-negative")
+    if burst_interval_seconds < 0:
+        raise ValueError("burst_interval_seconds must be non-negative")
+    if num_bursts and requests_per_burst and not prompts:
+        raise ValueError("prompts must not be empty")
+    if max_new_tokens <= 0:
+        raise ValueError("max_new_tokens must be greater than zero")
+
     requests: list[LoadRequest] = []
     n_prompts = len(prompts)
     flat_index = 0
