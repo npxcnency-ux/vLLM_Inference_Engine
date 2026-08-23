@@ -109,22 +109,23 @@ def bench_phase2(model, tokenizer, device):
     print(f"{'='*70}")
     N = 4
     # Prefill all
+    t_wall = time.perf_counter()
     states = []
     for p in PROMPTS[:N]:
         ids = tokenizer(p, return_tensors="pt").input_ids.to(device)
-        t0 = time.perf_counter()
         with torch.no_grad():
             out = model(ids, use_cache=True)
+        first_token = int(out.logits[0,-1].argmax())
         states.append({"past": out.past_key_values,
-                       "next": int(out.logits[0,-1].argmax()),
-                       "generated": [], "ttft_ms": (time.perf_counter()-t0)*1000,
+                       "next": first_token,
+                       "generated": [first_token],
+                       "ttft_ms": (time.perf_counter()-t_wall)*1000,
                        "tok_ms": []})
 
     eos = tokenizer.eos_token_id
-    t_wall = time.perf_counter()
     while True:
         active = [s for s in states if len(s["generated"]) < MAX_TOKENS
-                  and not (eos and s["generated"] and s["generated"][-1] == eos)]
+                  and not (eos is not None and s["generated"][-1] == eos)]
         if not active: break
         for s in active:
             t1 = time.perf_counter()
@@ -162,7 +163,7 @@ def bench_phase4_prefill_budget(model, tokenizer, device):
     print("  PHASE 4 / 9 — Prefill Budget & Chunked Prefill")
     print(f"{'='*70}")
     CHUNK = 128  # from config.prefill_chunk_size
-    long_prompt = "Explain machine learning. " * 20   # ~100+ tokens
+    long_prompt = "Explain machine learning. " * 100  # comfortably over one chunk
     short_prompt = "Hi."
 
     # Simulate: long prompt in chunks, short prompt interleaved
@@ -214,7 +215,7 @@ def bench_phase8_live_kv(model, tokenizer, device):
     from inference_engine.engine.paged_kv_cache import PagedKVCacheManager
     from inference_engine.engine.block_allocator import BlockAllocator
     from inference_engine.engine.attention_wrapper import (
-        extract_new_token_kv, build_past_key_values
+        _extract_kv_layer, extract_new_token_kv, build_past_key_values
     )
     from inference_engine.engine.sequence import Sequence
     from inference_engine.engine.kv_cache_config import compute_kv_cache_config
@@ -230,10 +231,18 @@ def bench_phase8_live_kv(model, tokenizer, device):
 
     seq = Sequence.create("Hello world test", ids[0].tolist(), 5)
     allocator.allocate(seq.seq_id, num_blocks=2)
-    token_pos = ids.shape[1] - 1
+    prompt_len = ids.shape[1]
+    allocator.set_token_count(seq.seq_id, prompt_len)
     for l in range(kv_cfg.num_layers):
-        k, v = extract_new_token_kv(out.past_key_values, l, token_pos)
-        paged_kv.write_kv(seq.seq_id, l, token_pos, k, v)
+        layer_keys, layer_values = _extract_kv_layer(out.past_key_values, l)
+        for token_pos in range(prompt_len):
+            paged_kv.write_kv(
+                seq.seq_id,
+                l,
+                token_pos,
+                layer_keys[0, :, token_pos, :],
+                layer_values[0, :, token_pos, :],
+            )
 
     N = 20
     # ── (A) live past_kv path (Phase 8 fix — current behaviour)
@@ -248,9 +257,11 @@ def bench_phase8_live_kv(model, tokenizer, device):
         next_tok = torch.tensor([[int(step_out.logits[0,-1].argmax())]], device=device)
         past = step_out.past_key_values
         # Write to pool (still happens, but cheap)
+        allocator.write_token(seq.seq_id)
+        token_pos = prompt_len + i
         for l in range(kv_cfg.num_layers):
-            k, v = extract_new_token_kv(step_out.past_key_values, l, token_pos+i+1)
-            paged_kv.write_kv(seq.seq_id, l, token_pos+i+1, k, v)
+            k, v = extract_new_token_kv(step_out.past_key_values, l, token_pos)
+            paged_kv.write_kv(seq.seq_id, l, token_pos, k, v)
 
     # ── (B) pool-reconstruct path (old bug — was doing this every step)
     times_reconstruct = []

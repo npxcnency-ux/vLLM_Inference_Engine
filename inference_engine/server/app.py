@@ -165,7 +165,7 @@ async def endpoint_generate(request: GenerateRequest):
             )
         except Exception as exc:
             logger.exception("Inference error: %s", exc)
-            raise HTTPException(status_code=500, detail=str(exc))
+            raise HTTPException(status_code=500, detail="Generation failed") from exc
 
     _collector.append(result)
 

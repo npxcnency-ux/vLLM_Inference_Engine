@@ -83,6 +83,11 @@ class BlockAllocator:
     """
 
     def __init__(self, num_blocks: int, block_size: int) -> None:
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be greater than zero")
+        if block_size <= 0:
+            raise ValueError("block_size must be greater than zero")
+
         self._num_blocks = num_blocks
         self._block_size = block_size
 
@@ -115,6 +120,9 @@ class BlockAllocator:
         OutOfBlocksError
             If the pool does not have *num_blocks* free blocks.
         """
+        if num_blocks <= 0:
+            raise ValueError("num_blocks must be greater than zero")
+
         with self._lock:
             available = len(self._free_block_ids)
             if num_blocks > available:
@@ -169,6 +177,9 @@ class BlockAllocator:
                 raise BlockNotFoundError(block_id)
 
             blk = self._blocks[block_id]
+            if blk.is_free():
+                return
+
             # Remove from the owning sequence's list
             owner = blk.seq_id
             if owner is not None and owner in self._seq_to_blocks:
@@ -205,36 +216,70 @@ class BlockAllocator:
         OutOfBlocksError
             If a new block is needed but the pool is exhausted.
         """
+        if count < 0:
+            raise ValueError("count must be non-negative")
+        if count == 0:
+            return []
+
         with self._lock:
-            if seq_id not in self._seq_to_blocks or not self._seq_to_blocks[seq_id]:
+            block_ids = self._seq_to_blocks.get(seq_id)
+            if not block_ids:
                 raise BlockAllocatorError(
                     f"No blocks allocated for seq_id={seq_id!r}"
                 )
 
-        newly_allocated: list[int] = []
+            current_tokens = sum(self._blocks[bid].tokens_used for bid in block_ids)
+            target_tokens = current_tokens + count
+            required_blocks = (target_tokens + self._block_size - 1) // self._block_size
+            extra_blocks = max(0, required_blocks - len(block_ids))
+            available = len(self._free_block_ids)
+            if extra_blocks > available:
+                raise OutOfBlocksError(requested=extra_blocks, available=available)
+
+            newly_allocated: list[int] = []
+            t_now = time.perf_counter()
+            for _ in range(extra_blocks):
+                block_id = self._free_block_ids.pop(0)
+                blk = self._blocks[block_id]
+                blk.seq_id = seq_id
+                blk.ref_count = 1
+                blk.is_dirty = False
+                blk.tokens_used = 0
+                blk.allocated_at = t_now
+                block_ids.append(block_id)
+                newly_allocated.append(block_id)
+            self._total_allocated += extra_blocks
+
+            self._set_token_count_locked(block_ids, target_tokens)
+            return newly_allocated
+
+    def set_token_count(self, seq_id: str, count: int) -> None:
+        """Set exact filled-token accounting across a sequence's blocks."""
+        if count < 0:
+            raise ValueError("count must be non-negative")
+
+        with self._lock:
+            block_ids = self._seq_to_blocks.get(seq_id)
+            if not block_ids:
+                raise BlockAllocatorError(
+                    f"No blocks allocated for seq_id={seq_id!r}"
+                )
+            capacity = len(block_ids) * self._block_size
+            if count > capacity:
+                raise ValueError(
+                    f"Token count {count} exceeds sequence capacity {capacity}"
+                )
+            self._set_token_count_locked(block_ids, count)
+
+    def _set_token_count_locked(self, block_ids: list[int], count: int) -> None:
+        """Distribute *count* filled slots in block order; caller holds lock."""
         remaining = count
-
-        while remaining > 0:
-            with self._lock:
-                block_ids = self._seq_to_blocks[seq_id]
-                last_block_id = block_ids[-1]
-                blk = self._blocks[last_block_id]
-
-                slots_in_current = blk.remaining_slots()
-                write_now = min(remaining, slots_in_current)
-                blk.tokens_used += write_now
-                blk.is_dirty = True
-                remaining -= write_now
-
-                need_new_block = remaining > 0 or blk.is_full()
-
-            if remaining > 0:
-                # Need to spill into a new block — allocate outside the lock
-                # so that allocate() can acquire it cleanly.
-                new_ids = self.allocate(seq_id, 1)
-                newly_allocated.extend(new_ids)
-
-        return newly_allocated
+        for block_id in block_ids:
+            tokens_used = min(remaining, self._block_size)
+            blk = self._blocks[block_id]
+            blk.tokens_used = tokens_used
+            blk.is_dirty = tokens_used > 0
+            remaining -= tokens_used
 
     def get_blocks(self, seq_id: str) -> list[int]:
         """Return list of block_ids owned by *seq_id* (in allocation order)."""
@@ -331,6 +376,14 @@ class BlockAllocator:
         """Number of blocks allocated to *seq_id*."""
         with self._lock:
             return len(self._seq_to_blocks.get(seq_id, []))
+
+    def num_tokens_for_seq(self, seq_id: str) -> int:
+        """Number of filled token slots allocated to *seq_id*."""
+        with self._lock:
+            return sum(
+                self._blocks[block_id].tokens_used
+                for block_id in self._seq_to_blocks.get(seq_id, [])
+            )
 
     def active_sequences(self) -> list[str]:
         """List of seq_ids that currently hold at least one block."""

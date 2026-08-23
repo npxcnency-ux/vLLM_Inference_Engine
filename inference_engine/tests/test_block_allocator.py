@@ -76,6 +76,24 @@ def test_write_token_auto_allocates_new_block(allocator: BlockAllocator) -> None
     assert allocator.num_blocks_for_seq("seq1") == 2
 
 
+def test_write_token_fills_preallocated_blocks_in_order(allocator: BlockAllocator) -> None:
+    """Token accounting must not leave zero-filled holes before used blocks."""
+    block_ids = allocator.allocate("seq1", 3)
+    allocator.write_token("seq1", 20)
+
+    assert [allocator.get_block(bid).tokens_used for bid in block_ids] == [16, 4, 0]
+    assert allocator.stats()["total_allocated"] == 3
+
+
+def test_free_block_is_idempotent(allocator: BlockAllocator) -> None:
+    """Freeing an already-free block must not duplicate it in the free pool."""
+    block_id = allocator.allocate("seq1", 1)[0]
+    allocator.free_block(block_id)
+    allocator.free_block(block_id)
+
+    assert allocator.num_free_blocks() == 16
+
+
 def test_evict_lru(allocator: BlockAllocator) -> None:
     """evict_lru() removes the sequence whose last block was allocated earliest."""
     allocator.allocate("seq1", 2)

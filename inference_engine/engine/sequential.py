@@ -202,12 +202,18 @@ def decode(
         Wall-clock latency (ms) for each decode step AFTER the first token.
         Length is len(generated_ids) - 1.
     """
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be at least 1")
+
     device = next(model.parameters()).device
 
     generated_ids: List[int] = [first_token_id]
     per_token_latencies_ms: List[float] = []
 
     current_token = torch.tensor([[first_token_id]], dtype=torch.long, device=device)
+
+    if eos_token_id is not None and first_token_id == eos_token_id:
+        return generated_ids, per_token_latencies_ms
 
     for step in range(max_new_tokens - 1):  # -1 because first token already counted
         t_step = time.perf_counter()
@@ -261,6 +267,9 @@ def generate(
     which is the most informative point for a sequential baseline: it shows the
     peak footprint a single request leaves behind.
     """
+    if max_new_tokens < 1:
+        raise ValueError("max_new_tokens must be at least 1")
+
     timestamp = datetime.now(timezone.utc).isoformat()
 
     # Count prompt tokens (don't move to device yet; prefill() handles that)

@@ -223,7 +223,7 @@ Submits a prompt for token generation. Blocks until generation is complete.
     "ttft_ms": 110.2,
     "total_latency_ms": 870.5,
     "tokens_per_second": 57.4,
-    "per_token_latencies_ms": [110.2, 15.5, 15.6, ...],
+    "per_token_latencies_ms": [15.5, 15.6, ...],
     "gpu_memory_allocated_mb": 1150.4,
     "gpu_memory_reserved_mb": 2048.0,
     "timestamp": "2026-06-24T00:44:00Z"
@@ -240,35 +240,22 @@ Exposes system-wide telemetry computed by the `MetricsAggregator`.
 - **Response**:
   ```json
   {
-    "summary": {
-      "total_requests": 25,
-      "p50_latency_ms": 780.2,
-      "p95_latency_ms": 1205.4,
-      "p99_latency_ms": 1450.0,
-      "mean_ttft_ms": 95.3,
-      "p50_ttft_ms": 90.1,
-      "p95_ttft_ms": 115.0
-    },
-    "throughput": {
-      "rolling_token_throughput": 124.5,
-      "rolling_request_throughput": 2.4
-    },
-    "slo": {
-      "ttft_compliance_fraction": 0.98,
-      "total_latency_compliance_fraction": 0.95
-    },
     "system": {
-      "oom_count": 0,
-      "swap_out_count": 2,
-      "active_requests": 3,
-      "waiting_requests": 0
+      "requests_in_flight": 3,
+      "requests_waiting": 0,
+      "requests_finished_total": 25,
+      "requests_oom_total": 0,
+      "requests_swapped_total": 2,
+      "throughput_tokens_per_sec": 124.5
     },
-    "kv_cache": {
-      "gpu_blocks_used": 48,
-      "gpu_blocks_free": 208,
-      "cpu_blocks_used": 16,
-      "cpu_blocks_free": 112
-    }
+    "e2e_latency": {"ttft_ms": {"p50": 90.1, "p95": 115.0, "p99": 130.0}},
+    "slo_compliance": {"ttft_compliance_pct": 98.0, "sample_size": 25},
+    "stage_breakdown": {"prefill": {}, "decode": {}},
+    "kv_cache": {},
+    "paged_kv_cache": {},
+    "cpu_swap": {},
+    "queue_stats": {},
+    "scheduler": {"batch_size_over_time": [], "scheduler_step_latency_ms": []}
   }
   ```
 
@@ -276,7 +263,7 @@ Exposes system-wide telemetry computed by the `MetricsAggregator`.
 
 ## ⚙️ Configuration
 
-Tunable parameters located in [inference_engine/config.py](file:///Users/nikhilmourya/Desktop/PageServe/inference_engine/config.py) can be overridden using environment variables:
+Tunable parameters located in [`inference_engine/config.py`](inference_engine/config.py) can be overridden using environment variables:
 
 | Environment Variable | Default Value | Description |
 | --- | --- | --- |
@@ -337,7 +324,7 @@ pytest inference_engine/tests/ -v
 ## 🗺️ What I'd Do Differently
 
 - **Tensor-Level Batching**: Implement actual tensor batching using padded tensors or jagged attention operators (e.g., FlashAttention-2 or vLLM custom CUDA kernels) instead of thread-based sequence serialization.
-- **Asynchronous Completion Events**: Replace polling in FastAPI `/generate` endpoints with asyncio `Event` hooks triggered by the scheduler loop, eliminating busy-wait polling overhead.
+- **Disconnect-Aware Cancellation**: Propagate client disconnects into already-admitted sequences so expensive decode work can be stopped immediately.
 - **Speculative Decoding**: Integrate a smaller draft model to verify candidate tokens in parallel, improving decode step speeds.
 - **Dynamic Block Sizing**: Experiment with block sizes of 8 and 32 to study the impact of chunk overhead on compute performance and cache mapping.
 

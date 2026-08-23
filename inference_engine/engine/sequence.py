@@ -122,6 +122,8 @@ class Sequence:
     prefill_offset: int = 0           # tokens processed so far (chunked prefill)
     prefill_chunk_size: int = 128     # frozen at admission from config
     prefill_start_time: float = 0.0   # perf_counter() when first chunk started
+    finish_time: float = 0.0          # perf_counter() when terminal state was reached
+    error_message: str = ""           # internal failure detail, if any
 
     # ── Convenience helpers ───────────────────────────────────────────────────
 
@@ -173,4 +175,6 @@ class Sequence:
             prefill_offset=0,
             prefill_chunk_size=128,   # overwritten by scheduler at admission
             prefill_start_time=0.0,
+            finish_time=0.0,
+            error_message="",
         )

@@ -170,6 +170,8 @@ class CPUSwapManager:
         num_needed = len(device_block_ids)
 
         with self._lock:
+            if seq_id in self._swapped:
+                raise ValueError(f"seq_id={seq_id!r} is already swapped out")
             if num_needed > len(self._free_cpu_block_ids):
                 raise CPUSwapError(
                     requested=num_needed,
@@ -183,21 +185,23 @@ class CPUSwapManager:
 
         # Copy device → CPU (outside the lock — tensor ops can run freely)
         num_layers = self.kv_cache_config.num_layers
-        for dev_bid, cpu_bid in zip(device_block_ids, cpu_block_ids):
-            for layer_idx in range(num_layers):
-                # Shape of each slice: [block_size, num_kv_heads, head_dim]
-                self.cpu_key_pool[cpu_bid, :, layer_idx].copy_(
-                    paged_kv_cache.key_pool[dev_bid, :, layer_idx]
-                )
-                self.cpu_value_pool[cpu_bid, :, layer_idx].copy_(
-                    paged_kv_cache.value_pool[dev_bid, :, layer_idx]
-                )
+        try:
+            for dev_bid, cpu_bid in zip(device_block_ids, cpu_block_ids):
+                for layer_idx in range(num_layers):
+                    # Shape of each slice: [block_size, num_kv_heads, head_dim]
+                    self.cpu_key_pool[cpu_bid, :, layer_idx].copy_(
+                        paged_kv_cache.key_pool[dev_bid, :, layer_idx]
+                    )
+                    self.cpu_value_pool[cpu_bid, :, layer_idx].copy_(
+                        paged_kv_cache.value_pool[dev_bid, :, layer_idx]
+                    )
+        except Exception:
+            with self._lock:
+                self._free_cpu_block_ids.extend(cpu_block_ids)
+            raise
 
         # Count total filled tokens before zeroing/freeing
-        num_tokens: int = sum(
-            block_allocator._blocks[bid].tokens_used
-            for bid in device_block_ids
-        )
+        num_tokens = block_allocator.num_tokens_for_seq(seq_id)
 
         # Zero device pool slots AFTER copying data (spec requirement)
         paged_kv_cache.clear_sequence(seq_id)
@@ -255,10 +259,10 @@ class CPUSwapManager:
             If the device pool still has insufficient space.  The caller
             decides what to do — this manager's state is unchanged.
         """
-        if seq_id not in self._swapped:
+        with self._lock:
+            swapped = self._swapped.get(seq_id)
+        if swapped is None:
             raise KeyError(f"seq_id={seq_id!r} is not currently swapped out")
-
-        swapped = self._swapped[seq_id]
 
         # Try to claim device blocks — let OutOfBlocksError propagate
         device_block_ids: list[int] = block_allocator.allocate(
@@ -267,26 +271,20 @@ class CPUSwapManager:
 
         # Copy CPU → device
         num_layers = self.kv_cache_config.num_layers
-        for dev_bid, cpu_bid in zip(device_block_ids, swapped.cpu_block_ids):
-            for layer_idx in range(num_layers):
-                paged_kv_cache.key_pool[dev_bid, :, layer_idx].copy_(
-                    self.cpu_key_pool[cpu_bid, :, layer_idx]
-                )
-                paged_kv_cache.value_pool[dev_bid, :, layer_idx].copy_(
-                    self.cpu_value_pool[cpu_bid, :, layer_idx]
-                )
+        try:
+            for dev_bid, cpu_bid in zip(device_block_ids, swapped.cpu_block_ids):
+                for layer_idx in range(num_layers):
+                    paged_kv_cache.key_pool[dev_bid, :, layer_idx].copy_(
+                        self.cpu_key_pool[cpu_bid, :, layer_idx]
+                    )
+                    paged_kv_cache.value_pool[dev_bid, :, layer_idx].copy_(
+                        self.cpu_value_pool[cpu_bid, :, layer_idx]
+                    )
+        except Exception:
+            block_allocator.free(seq_id)
+            raise
 
-        # Restore tokens_used on each device block
-        # Full blocks get block_size tokens; the last block gets the remainder.
-        remaining = swapped.num_tokens
-        for i, dev_bid in enumerate(device_block_ids):
-            if remaining >= self.block_size:
-                block_allocator._blocks[dev_bid].tokens_used = self.block_size
-                remaining -= self.block_size
-            else:
-                block_allocator._blocks[dev_bid].tokens_used = remaining
-                remaining = 0
-            block_allocator._blocks[dev_bid].is_dirty = True
+        block_allocator.set_token_count(seq_id, swapped.num_tokens)
 
         with self._lock:
             # Return CPU blocks to the free pool
@@ -301,7 +299,13 @@ class CPUSwapManager:
 
     def is_swapped(self, seq_id: str) -> bool:
         """Return True if *seq_id* currently has data staged in CPU memory."""
-        return seq_id in self._swapped
+        with self._lock:
+            return seq_id in self._swapped
+
+    def get_swapped_sequence(self, seq_id: str) -> SwappedSequence | None:
+        """Return swap metadata for *seq_id*, or None when it is resident."""
+        with self._lock:
+            return self._swapped.get(seq_id)
 
     def stats(self) -> dict:
         """Return a snapshot of CPUSwapManager state.
