@@ -482,12 +482,16 @@ class ContinuousBatchingScheduler:
         if is_first_chunk:
             past_kv = None
         else:
+            # Plain DynamicCache (model_config=None) for the same reason as the
+            # decode rebuild path: we inject accumulated KV in one shot, which
+            # is incompatible with config-aware sliding-window layer state.
             past_kv = build_past_key_values(
                 seq_id=seq.seq_id,
                 paged_kv_cache=self.paged_kv_cache,
                 num_layers=self.kv_cache_config.num_layers,
                 device=str(self._device),
                 use_dynamic_cache=True,
+                model_config=None,
             )
 
         # ── Forward pass over this chunk ──────────────────────────────────────
@@ -598,12 +602,24 @@ class ContinuousBatchingScheduler:
         # past_key_values=None — in that case we rebuild once from the pool).
         past_kv = seq.past_key_values
         if past_kv is None:
+            # Rebuild from the paged pool (swap-in, or first decode after
+            # chunked prefill).  Use a plain DynamicCache (model_config=None)
+            # rather than a config-aware one: config-aware sliding-window
+            # layers assume KV was streamed in one token at a time, but here we
+            # inject the whole history at once for a single-token decode step —
+            # that mismatch corrupts the sliding-window layers' position/mask
+            # state and produces garbled output.  A plain cache treats every
+            # layer as full-attention on rebuild, which is correct for the
+            # short/medium sequences that actually get swapped; very long
+            # (>sliding_window) swapped sequences lose window semantics but
+            # still decode coherently (swap is already a degraded path).
             past_kv = build_past_key_values(
                 seq_id=seq.seq_id,
                 paged_kv_cache=self.paged_kv_cache,
                 num_layers=self.kv_cache_config.num_layers,
                 device=str(self._device),
                 use_dynamic_cache=True,
+                model_config=None,
             )
 
         # The decode input token is the newest generated token.  Reconstruct

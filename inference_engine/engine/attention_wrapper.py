@@ -115,6 +115,7 @@ def reconstruct_dynamic_cache(
     paged_kv_cache: "Any",  # PagedKVCacheManager
     num_layers: int,
     device: str,
+    model_config: Any = None,
 ) -> Any:
     """Assemble a DynamicCache past_key_values object from the paged pool.
 
@@ -125,6 +126,14 @@ def reconstruct_dynamic_cache(
     ----------
     seq_id, paged_kv_cache, num_layers, device:
         See :func:`reconstruct_past_key_values`.
+    model_config:
+        When provided, the DynamicCache is built with this config so that
+        per-layer cache types (e.g. Gemma 4's sliding-window vs global layers)
+        match the model.  This makes sliding-window layers truncate to their
+        window on ``update``, matching native generation for long sequences.
+        When None, a plain DynamicCache is used (correct for homogeneous,
+        full-attention models like Qwen, and for sequences shorter than the
+        sliding window).
 
     Returns
     -------
@@ -133,7 +142,7 @@ def reconstruct_dynamic_cache(
     """
     from transformers import DynamicCache
 
-    cache = DynamicCache()
+    cache = DynamicCache(config=model_config) if model_config is not None else DynamicCache()
     for layer_idx in range(num_layers):
         keys, values = paged_kv_cache.read_kv_sequence(seq_id, layer_idx)
         key_tensor = keys.unsqueeze(0).permute(0, 2, 1, 3).to(device)
@@ -148,6 +157,7 @@ def build_past_key_values(
     num_layers: int,
     device: str,
     use_dynamic_cache: bool = True,
+    model_config: Any = None,
 ) -> Any:
     """Entry point: assemble past_key_values from the paged pool.
 
@@ -160,6 +170,9 @@ def build_past_key_values(
         Forwarded to the underlying reconstruct function.
     use_dynamic_cache:
         When True, attempt to build a ``DynamicCache`` object.
+    model_config:
+        Optional model config forwarded to :func:`reconstruct_dynamic_cache`
+        so per-layer cache types (sliding-window vs global) match the model.
 
     Returns
     -------
@@ -170,7 +183,9 @@ def build_past_key_values(
 
     if use_dynamic_cache:
         try:
-            return reconstruct_dynamic_cache(seq_id, paged_kv_cache, num_layers, device)
+            return reconstruct_dynamic_cache(
+                seq_id, paged_kv_cache, num_layers, device, model_config=model_config
+            )
         except Exception:
             if not _dynamic_cache_warned:
                 logger.warning(

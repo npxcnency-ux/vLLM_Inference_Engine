@@ -46,6 +46,10 @@ class PagedKVCacheManager:
         self.num_layers: int = kv_cache_config.num_layers
         self.num_kv_heads: int = kv_cache_config.num_kv_heads
         self.head_dim: int = kv_cache_config.head_dim
+        # Per-layer true head_dim widths.  For heterogeneous models (Gemma 4)
+        # the pool is allocated at head_dim (=max) but each layer only fills its
+        # true width; the trailing columns stay zero-padded.
+        self.head_dims: list[int] = kv_cache_config.head_dims
         self.block_size: int = config.kv_block_size
         self.num_blocks: int = config.kv_num_blocks
         self.device: str = config.device
@@ -97,9 +101,12 @@ class PagedKVCacheManager:
         block_ids = self.block_allocator.get_blocks(seq_id)
         physical_block_id = block_ids[block_idx_in_seq]
 
-        # Direct tensor index assignment — no torch.cat / stack
-        self.key_pool[physical_block_id, slot_within_block, layer_idx] = key_tensor
-        self.value_pool[physical_block_id, slot_within_block, layer_idx] = value_tensor
+        # Direct tensor index assignment — no torch.cat / stack.
+        # Slice to the layer's true head_dim: for a padded pool (Gemma 4) a
+        # 256-dim layer writes only the first 256 columns, leaving the rest 0.
+        hd = self.head_dims[layer_idx]
+        self.key_pool[physical_block_id, slot_within_block, layer_idx, :, :hd] = key_tensor
+        self.value_pool[physical_block_id, slot_within_block, layer_idx, :, :hd] = value_tensor
 
         # Track write cursor
         with self._lock:
@@ -128,18 +135,21 @@ class PagedKVCacheManager:
         key_slices: list[torch.Tensor] = []
         val_slices: list[torch.Tensor] = []
 
+        # Read back only the layer's true head_dim, dropping any zero padding
+        # so the reconstructed KV matches the model layer's real width.
+        hd = self.head_dims[layer_idx]
         for bid in block_ids:
             tokens_used = self.block_allocator.get_block(bid).tokens_used
             if tokens_used <= 0:
                 continue
-            # key_pool[bid, :tokens_used, layer_idx] → [tokens_used, num_kv_heads, head_dim]
-            key_slices.append(self.key_pool[bid, :tokens_used, layer_idx])
-            val_slices.append(self.value_pool[bid, :tokens_used, layer_idx])
+            # key_pool[bid, :tokens_used, layer_idx, :, :hd] → [tokens_used, num_kv_heads, hd]
+            key_slices.append(self.key_pool[bid, :tokens_used, layer_idx, :, :hd])
+            val_slices.append(self.value_pool[bid, :tokens_used, layer_idx, :, :hd])
 
         if not key_slices:
             # Return empty tensors with correct trailing dims
             empty = torch.zeros(
-                0, self.num_kv_heads, self.head_dim,
+                0, self.num_kv_heads, hd,
                 dtype=self.dtype, device=self.device,
             )
             return empty, empty.clone()
@@ -163,8 +173,9 @@ class PagedKVCacheManager:
 
         This is the low-level accessor — empty slots are NOT filtered out.
         """
-        keys = self.key_pool[block_id, :, layer_idx]    # [block_size, H, D]
-        values = self.value_pool[block_id, :, layer_idx]
+        hd = self.head_dims[layer_idx]
+        keys = self.key_pool[block_id, :, layer_idx, :, :hd]      # [block_size, H, hd]
+        values = self.value_pool[block_id, :, layer_idx, :, :hd]
         return keys, values
 
     # ── Maintenance ───────────────────────────────────────────────────────────

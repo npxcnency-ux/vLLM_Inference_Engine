@@ -34,7 +34,10 @@ def _auto_detect_device() -> str:
 @dataclass
 class Config:
     # ── Model ─────────────────────────────────────────────────────────────────
-    model_name: str = "Qwen/Qwen2-0.5B"
+    # Instruct 版而非 base 版：base 模型只会文本续写、不会对话（问"首都是哪"会续
+    # 写成选择题）。Qwen2 在 Apple MPS 上低精度支持成熟，不像 Gemma 4 会退化
+    # （Gemma 4 在 MPS 上的问题见 docs/specs/gemma4-e4b-adaptation.md，改用 MLX）。
+    model_name: str = "Qwen/Qwen2-0.5B-Instruct"
 
     # ── Inference defaults ────────────────────────────────────────────────────
     max_new_tokens: int = 50

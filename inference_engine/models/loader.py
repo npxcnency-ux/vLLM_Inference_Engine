@@ -66,14 +66,35 @@ def load_model_and_tokenizer(config: Config) -> LoadedModel:
         # Load to CPU first, then move to MPS in one shot.
         # device_map="auto" on MPS can silently dispatch ops to CPU (float32
         # fallback), which corrupts memory measurements.
+        #
+        # dtype on MPS is a real correctness knob, not just speed/memory:
+        # PyTorch's Metal kernels for bf16/fp16 are less precise than the CPU
+        # reference (which does internal fp32 accumulation). For most models
+        # (e.g. Qwen2) fp16 is fine. But numerically-sensitive deep models
+        # like Gemma 4 (42 layers) accumulate MPS low-precision error layer by
+        # layer until the argmax flips and long-form decode collapses into
+        # single-token repetition — bf16 fails immediately, fp16 fails on long
+        # sequences, only fp32 is stable throughout (verified via CPU-vs-MPS
+        # per-layer diff; see docs/specs/gemma4-e4b-adaptation.md §6.5).
+        # Default fp16 (fast, half memory); override with MPS_DTYPE=float32 for
+        # sensitive models at the cost of ~2x memory.
+        import os
+        mps_dtype = {
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+        }.get(os.environ.get("MPS_DTYPE", "float16").lower(), torch.float16)
         model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            dtype=torch.float16,
+            dtype=mps_dtype,
             device_map=None,          # <-- intentional, not a mistake
             low_cpu_mem_usage=True,   # reduce peak RAM during load
         )
         model = model.to("mps")
-        logger.info("Model loaded to MPS via explicit .to('mps')")
+        logger.info("Model loaded to MPS via explicit .to('mps') in %s", mps_dtype)
 
     else:  # cpu
         # float16 matmuls on CPU are emulated → very slow. Use float32.

@@ -106,6 +106,11 @@ class CPUSwapManager:
 
         # ── CPU tensor pool — always pinned to CPU regardless of model device ─
         # Shape: [num_cpu_blocks, block_size, num_layers, num_kv_heads, head_dim]
+        # head_dim is the MAX across layers (padded pool for heterogeneous
+        # models like Gemma 4).  Both this pool and the device pool pad narrow
+        # layers to the same max width with zeros, so the per-layer whole-slot
+        # copies in swap_out/swap_in stay shape-aligned and correct — the extra
+        # padding columns are just zeros copied on both sides.
         self.cpu_key_pool: torch.Tensor = torch.zeros(
             [
                 num_cpu_blocks,
