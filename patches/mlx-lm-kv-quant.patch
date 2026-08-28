@@ -1,0 +1,84 @@
+--- a/mlx_lm/server.py
++++ b/mlx_lm/server.py
+@@ -36,6 +36,7 @@
+ from .generate import (
+     BatchGenerator,
+     SequenceStateMachine,
++    maybe_quantize_kv_cache,
+     stream_generate,
+ )
+ from .models.cache import (
+@@ -372,6 +373,11 @@
+         is_batchable = is_batchable and all(
+             hasattr(c, "merge") for c in make_prompt_cache(model)
+         )
++        # KV cache quantization uses QuantizedKVCache which lacks a `merge`
++        # classmethod required by BatchGenerator's continuous batching.
++        # Fall back to the sequential (stream_generate) path when kv_bits is set.
++        if getattr(self.cli_args, "kv_bits", None) is not None:
++            is_batchable = False
+ 
+         # Update the member variables
+         self.model_key = (model_path, adapter_path, draft_model_path)
+@@ -985,6 +991,9 @@
+                 num_draft_tokens=args.num_draft_tokens,
+                 prompt_progress_callback=progress,
+                 prefill_step_size=self.cli_args.prefill_step_size,
++                kv_bits=self.cli_args.kv_bits,
++                kv_group_size=self.cli_args.kv_group_size,
++                quantized_kv_start=self.cli_args.quantized_kv_start,
+             ):
+                 finish_reason = gen.finish_reason
+                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)
+@@ -1725,6 +1734,13 @@
+         "it only implements basic security checks."
+     )
+     logging.info(f"Starting httpd at {host} on port {port}...")
++    if getattr(response_generator.model_provider.cli_args, "kv_bits", None) is not None:
++        _ka = response_generator.model_provider.cli_args
++        logging.info(
++            f"KV cache quantization: bits={_ka.kv_bits} "
++            f"group_size={_ka.kv_group_size} "
++            f"start={_ka.quantized_kv_start}"
++        )
+     try:
+         httpd.serve_forever()
+     except KeyboardInterrupt:
+@@ -1867,8 +1883,26 @@
+         type=int,
+         default=2048,
+         help="Step size for prefill processing (default: 2048)",
++    )
++    parser.add_argument(
++        "--kv-bits",
++        type=int,
++        default=None,
++        help="Bits for KV cache quantization (e.g. 4 or 8). Default: None (no quantization).",
+     )
+     parser.add_argument(
++        "--kv-group-size",
++        type=int,
++        default=64,
++        help="Group size for KV cache quantization. Default: 64",
++    )
++    parser.add_argument(
++        "--quantized-kv-start",
++        type=int,
++        default=0,
++        help="Start quantizing the KV cache once the sequence has this many tokens. Default: 0 (quantize from the start).",
++    )
++    parser.add_argument(
+         "--prompt-cache-size",
+         type=int,
+         default=10,
+--- a/mlx_lm/models/cache.py
++++ b/mlx_lm/models/cache.py
+@@ -319,6 +319,8 @@
+ 
+     @property
+     def nbytes(self):
++        if self.keys is None:
++            return 0
+         return tree_reduce(lambda a, x: a + x.nbytes, (self.keys, self.values), 0)
+ 
+ 
