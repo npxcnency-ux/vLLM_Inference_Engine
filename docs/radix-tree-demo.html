@@ -1,0 +1,996 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>SGLang RadixTree 建树 + Split + 淘汰 可视化</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    padding: 12px;
+    background: #f5f7fa;
+    color: #333;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  h1 { margin: 0 0 4px 0; font-size: 20px; flex-shrink: 0; }
+  .subtitle { color: #666; font-size: 12px; margin-bottom: 10px; flex-shrink: 0; }
+  .layout {
+    display: grid;
+    grid-template-columns: 340px 1fr;
+    gap: 12px;
+    flex: 1;
+    min-height: 0;
+  }
+  .panel {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .panel h3 { margin: 0 0 8px 0; font-size: 13px; color: #555; }
+
+  .current-step {
+    background: linear-gradient(135deg, #fff9e0 0%, #fff5c9 100%);
+    border: 1px solid #f0c040;
+    padding: 10px 12px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    min-height: 92px;
+  }
+  .step-index { color: #999; font-size: 11px; }
+  .step-desc { font-weight: bold; margin: 4px 0; font-size: 13px; }
+  .step-prompt {
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    color: #555;
+    word-break: break-all;
+    line-height: 1.5;
+  }
+  .step-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    margin-left: 4px;
+    color: #fff;
+  }
+  .b-insert { background: #2a9d2a; }
+  .b-split { background: #cc3333; }
+  .b-end { background: #7a6bbc; }
+  .b-evict { background: #d68000; }
+
+  .controls button {
+    display: block;
+    width: 100%;
+    padding: 8px;
+    margin: 3px 0;
+    border: 1px solid #ccc;
+    background: #fafafa;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.15s;
+  }
+  .controls button:hover { background: #eee; }
+  .controls button.primary { background: #007aff; color: white; border-color: #007aff; }
+  .controls button.primary:hover { background: #0060cc; }
+  .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .speed-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 12px; color: #666; }
+  .speed-row input { flex: 1; }
+
+  .stats {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 5px;
+    margin-top: 10px;
+  }
+  .stat {
+    background: #f0f4f8;
+    padding: 7px;
+    border-radius: 5px;
+    text-align: center;
+    font-size: 11px;
+    color: #666;
+  }
+  .stat .num { font-size: 17px; font-weight: bold; color: #007aff; display: block; margin-top: 2px; }
+  .stat.saved .num { color: #2a9d2a; }
+  .stat.pool .num { color: #d68000; }
+
+  .pool-bar {
+    margin-top: 6px;
+    height: 14px;
+    background: #eee;
+    border-radius: 7px;
+    overflow: hidden;
+    position: relative;
+  }
+  .pool-fill {
+    height: 100%;
+    background: linear-gradient(90deg, #4caf50 0%, #ffc107 60%, #f44336 90%);
+    transition: width 0.6s;
+  }
+  .pool-label {
+    position: absolute; top: 0; left: 0; right: 0; text-align: center;
+    font-size: 10px; line-height: 14px; color: #333; font-weight: bold;
+  }
+
+  .sessions {
+    max-height: 130px;
+    overflow-y: auto;
+    font-size: 11px;
+    margin-top: 8px;
+  }
+  .session-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 3px 6px; margin: 2px 0;
+    background: #f0f4f8; border-radius: 4px;
+  }
+  .session-row.ended { background: #f0e0e0; text-decoration: line-through; opacity: 0.6; }
+  .session-tag { font-family: 'SF Mono', monospace; font-weight: bold; }
+
+  .legend { font-size: 11px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed #ddd; }
+  .legend div { display: flex; align-items: center; margin: 3px 0; }
+  .legend .sw { width: 14px; height: 14px; margin-right: 6px; border: 2px solid; border-radius: 3px; }
+  .sw-normal { background: #fff; border-color: #666; }
+  .sw-shared { background: #fff2cc; border-color: #d68000; }
+  .sw-new { background: #d4f0d4; border-color: #2a9d2a; }
+  .sw-matched { background: #cce4ff; border-color: #007aff; }
+  .sw-split { background: #ffcccc; border-color: #cc3333; }
+  .sw-ref-down { background: #e6d5f0; border-color: #7a6bbc; }
+  .sw-evicted { background: #ddd; border-color: #999; opacity: 0.5; }
+
+  #tree-wrap {
+    overflow: auto;
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    flex: 1;
+    min-height: 0;
+  }
+  svg { display: block; }
+  .node rect { transition: all 0.5s cubic-bezier(0.4, 0, 0.2, 1); stroke-width: 2; }
+  .node rect.state-normal { fill: white; stroke: #666; }
+  .node rect.state-shared { fill: #fff2cc; stroke: #d68000; }
+  .node rect.state-new { fill: #d4f0d4; stroke: #2a9d2a; }
+  .node rect.state-matched { fill: #cce4ff; stroke: #007aff; }
+  .node rect.state-split-parent { fill: #ffe0e0; stroke: #cc3333; stroke-width: 3; }
+  .node rect.state-ref-down { fill: #e6d5f0; stroke: #7a6bbc; }
+  .node rect.state-evicting {
+    fill: #ddd;
+    stroke: #999;
+    opacity: 0.4;
+    stroke-dasharray: 4 3;
+  }
+  .node text { text-anchor: middle; font-size: 11px; pointer-events: none; }
+  .node text.title { font-weight: bold; font-size: 12px; }
+  .link { fill: none; stroke: #aaa; stroke-width: 2; transition: all 0.5s; }
+  .link.evicting { stroke: #ddd; stroke-dasharray: 4 3; opacity: 0.4; }
+
+  /* split 时的爆点动画 */
+  @keyframes flash-split {
+    0%, 100% { fill: #ffcccc; }
+    50% { fill: #ff8080; }
+  }
+  .node rect.flashing { animation: flash-split 0.4s ease-in-out 3; }
+
+  #log {
+    overflow-y: auto;
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 11px;
+    background: #1e1e1e;
+    color: #e0e0e0;
+    padding: 10px 12px;
+    border-radius: 8px;
+    margin-top: 12px;
+    line-height: 1.55;
+    flex-shrink: 0;
+    height: 240px;
+  }
+  #log .entry { padding: 1px 0; }
+  #log .entry.step { color: #ffd700; margin-top: 6px; padding: 4px 6px; background: #333; border-radius: 3px; }
+  #log .entry.split { color: #ff7070; font-weight: bold; }
+  #log .entry.new-node { color: #7fdd7f; }
+  #log .entry.match { color: #70b0ff; }
+  #log .entry.evict { color: #ffb060; font-weight: bold; }
+  #log .entry.end { color: #cc99ff; }
+</style>
+</head>
+<body>
+<h1>SGLang RadixTree 建树 · Split · 淘汰 可视化</h1>
+<div class="subtitle">
+  演示 <b>Split (节点拆分)</b> · <b>Session End (引用递减)</b> · <b>Eviction (LRU 淘汰)</b>。
+  Pool 容量 = 100 pages，淘汰策略：按需 evict（仅当分配时空闲不够才触发，只淘汰所缺量）。page_size = 16 tokens。
+  本图专注演示 <b>trie 骨架的拓扑变化</b>（split / evict / ref_count），
+  完整 CPU/GPU 数据流请看 <a href="cpu-gpu-flow-demo.html">cpu-gpu-flow-demo.html</a>。
+</div>
+<!-- 
+<div style="background:#fff8e1;border:1px solid #f0c040;border-radius:6px;padding:10px 12px;margin-bottom:12px;font-size:12px;line-height:1.6">
+  <b>ℹ️ 与 mini-sglang 源码对齐（重要修正）：</b>
+  真实实现中，节点里的 <code>_key / _value</code> 都是 <b>GPU tensor</b>（路径上重建时 <code>torch.cat</code> 拼接）；
+  <code>free_slots</code> 也是 <b>GPU int32 tensor</b>，不是 Python list；
+  不同 req 共享一个 <b>page_table 二维大矩阵</b>（不是每 req 一个 page_table）。
+</div> -->
+
+<div class="layout">
+  <div>
+    <div class="panel">
+      <div class="current-step" id="current-step">
+        <div class="step-index">准备就绪</div>
+        <div class="step-desc">点击「下一步」开始</div>
+        <div class="step-prompt"></div>
+      </div>
+      <div class="controls">
+        <button id="btn-next" class="primary">下一步 →</button>
+        <button id="btn-back">↩ 上一步</button>
+        <button id="btn-auto">▶ 自动播放</button>
+        <button id="btn-reset">↻ 重置</button>
+        <div class="speed-row">
+          <span>速度</span>
+          <input type="range" id="speed" min="800" max="4000" step="200" value="1800">
+          <span id="speed-label">1.8s</span>
+        </div>
+      </div>
+
+      <div class="stats">
+        <div class="stat">节点数<span class="num" id="stat-nodes">0</span></div>
+        <div class="stat">总 tokens<span class="num" id="stat-tokens">0</span></div>
+        <div class="stat pool">Pool 用量<span class="num" id="stat-pages">0</span></div>
+        <div class="stat saved">共享节省<span class="num" id="stat-saved">0</span></div>
+      </div>
+      <div class="pool-bar">
+        <div class="pool-fill" id="pool-fill" style="width:0"></div>
+        <div class="pool-label" id="pool-label">0 / 200 pages (0%)</div>
+      </div>
+
+      <h3 style="margin-top:12px;flex-shrink:0">活跃会话</h3>
+      <div class="sessions" id="sessions" style="flex:1;min-height:0;max-height:none"></div>
+
+      <div class="legend" style="flex-shrink:0">
+        <div><span class="sw sw-normal"></span>普通节点</div>
+        <div><span class="sw sw-shared"></span>共享 (ref&gt;1)</div>
+        <div><span class="sw sw-new"></span>本轮新增</div>
+        <div><span class="sw sw-matched"></span>本轮命中</div>
+        <div><span class="sw sw-split"></span>本轮 SPLIT 拆出</div>
+        <div><span class="sw sw-ref-down"></span>会话结束 ref--</div>
+        <div><span class="sw sw-evicted"></span>正在被淘汰</div>
+      </div>
+    </div>
+  </div>
+  <div style="display:flex;flex-direction:column;min-height:0;overflow:hidden">
+    <div id="tree-wrap"><svg id="tree" width="1200" height="500"></svg></div>
+    <div id="log"></div>
+  </div>
+</div>
+
+<script>
+// ============================================================================
+// 数据结构
+// ============================================================================
+const POOL_CAP = 100;              // page 数（10 U 场景容易触发 evict）
+// 对齐 mini-sglang CacheManager._allocate：按需淘汰（没阈值）
+let accessClock = 0;               // 全局访问时钟
+
+let nodeIdCounter = 0;
+class Node {
+  constructor(segments) {
+    this.id = nodeIdCounter++;
+    this.segments = segments;
+    this.children = new Map();
+    this.parent = null;
+    this.refCount = 0;
+    this.state = 'normal';
+    this.lastAccess = ++accessClock;
+    this.evicting = false;
+  }
+  get displayName() {
+    if (this === root) return 'root';
+    return this.segments.map(s => s.name).join(' | ');
+  }
+  get tokenCount() { return this.segments.reduce((a, b) => a + b.count, 0); }
+  get pageCount() { return Math.ceil(this.tokenCount / 16); }
+  isLeaf() { return this.children.size === 0; }
+  touch() { this.lastAccess = ++accessClock; }
+}
+
+let root;
+let sessions = new Map();  // userId -> {leaf, active, prompt}
+
+function resetTree() {
+  nodeIdCounter = 0;
+  accessClock = 0;
+  root = new Node([]);
+  sessions = new Map();
+}
+
+// ============================================================================
+// Split-aware insert：返回叶子节点（供 session 记录）
+// ============================================================================
+function clearStates() {
+  function walk(n) {
+    if (n.evicting) return;
+    n.state = (n !== root && n.refCount > 1) ? 'shared' : 'normal';
+    for (const c of n.children.values()) walk(c);
+  }
+  walk(root);
+}
+
+function insertPath(promptSegments, logFn) {
+  clearStates();
+  let cur = root;
+  let remaining = [...promptSegments];
+  let leaf = root;
+
+  // 沿 path 增 refCount（表示新会话占用这段）
+  const pathToInc = [];
+
+  while (remaining.length > 0) {
+    const firstName = remaining[0].name;
+    let child = cur.children.get(firstName);
+
+    if (!child) {
+      const n = new Node(remaining);
+      n.parent = cur;
+      n.refCount = 1;
+      n.state = 'new';
+      n.touch();
+      cur.children.set(firstName, n);
+      logFn('new-node', `  ✚ 新增节点 [${n.displayName}] (${n.tokenCount}t = ${n.pageCount} pages)`);
+      leaf = n;
+      remaining = [];
+    } else {
+      let matchIdx = 0;
+      while (matchIdx < child.segments.length &&
+             matchIdx < remaining.length &&
+             child.segments[matchIdx].name === remaining[matchIdx].name) {
+        matchIdx++;
+      }
+      if (matchIdx === child.segments.length) {
+        // 完全命中
+        child.refCount++;
+        child.state = 'matched';
+        child.touch();
+        logFn('match', `  ↓ 命中 [${child.displayName}] (${child.tokenCount}t, ref=${child.refCount})`);
+        remaining = remaining.slice(matchIdx);
+        cur = child;
+        leaf = child;
+      } else {
+        // 部分匹配 → SPLIT
+        const common = child.segments.slice(0, matchIdx);
+        const childRest = child.segments.slice(matchIdx);
+        const newRest = remaining.slice(matchIdx);
+
+        const parent = new Node(common);
+        parent.parent = cur;
+        parent.refCount = child.refCount + 1;
+        parent.state = 'split-parent';
+        parent.touch();
+
+        child.segments = childRest;
+        child.parent = parent;
+        parent.children.set(childRest[0].name, child);
+
+        if (newRest.length > 0) {
+          const nb = new Node(newRest);
+          nb.parent = parent;
+          nb.refCount = 1;
+          nb.state = 'new';
+          nb.touch();
+          parent.children.set(newRest[0].name, nb);
+          leaf = nb;
+        } else {
+          leaf = parent;
+        }
+        cur.children.set(firstName, parent);
+
+        logFn('split', `  ⚡ SPLIT 触发！`);
+        logFn('split', `     ├─ 拆出共享父 [${parent.displayName}] (${parent.tokenCount}t, ref=${parent.refCount})`);
+        logFn('split', `     ├─ 原节点后半 [${child.displayName}] (${child.tokenCount}t, ref=${child.refCount})`);
+        if (newRest.length > 0) {
+          logFn('new-node', `     └─ 新分支 [${parent.children.get(newRest[0].name).displayName}] (${parent.children.get(newRest[0].name).tokenCount}t)`);
+        }
+        remaining = [];
+      }
+    }
+  }
+
+  return leaf;
+}
+
+// ============================================================================
+// 会话结束：沿 leaf 到 root 减 refCount
+// ============================================================================
+function endSession(userId, logFn) {
+  clearStates();
+  const sess = sessions.get(userId);
+  if (!sess || !sess.active) {
+    logFn('end', `  会话 ${userId} 不存在或已结束`);
+    return;
+  }
+  sess.active = false;
+  logFn('end', `  ✗ 会话 ${userId} 结束，沿路径减引用计数`);
+  let cur = sess.leaf;
+  while (cur && cur !== root) {
+    cur.refCount = Math.max(0, cur.refCount - 1);
+    cur.state = 'ref-down';
+    logFn('end', `     └─ [${cur.displayName}] ref=${cur.refCount + 1}→${cur.refCount}`);
+    cur = cur.parent;
+  }
+}
+
+// ============================================================================
+// LRU 淘汰
+// ============================================================================
+function currentPageUsage() {
+  let sum = 0;
+  function walk(n) {
+    if (!n.evicting && n !== root) sum += n.pageCount;
+    for (const c of n.children.values()) walk(c);
+  }
+  walk(root);
+  return sum;
+}
+
+function collectEvictableLeaves() {
+  const leaves = [];
+  function walk(n) {
+    if (n === root) {
+      for (const c of n.children.values()) walk(c);
+      return;
+    }
+    if (n.children.size === 0 && n.refCount === 0 && !n.evicting) {
+      leaves.push(n);
+    }
+    for (const c of n.children.values()) walk(c);
+  }
+  walk(root);
+  leaves.sort((a, b) => a.lastAccess - b.lastAccess);
+  return leaves;
+}
+
+function evictForAllocation(needPages, logFn) {
+  // 对齐 mini-sglang: 只在分配时空闲不够才 evict，只淘汰所缺量
+  const cur = currentPageUsage();
+  const free = POOL_CAP - cur;
+  if (free >= needPages) return [];
+
+  const shortage = needPages - free;
+  logFn('evict', `  ▼ 需 ${needPages} pages，仅剩 ${free}，需 evict ${shortage} pages`);
+  clearStates();
+
+  const toEvict = [];
+  let freed = 0;
+  while (freed < shortage) {
+    const leaves = collectEvictableLeaves().filter(n => !toEvict.includes(n));
+    if (leaves.length === 0) {
+      logFn('evict', `  ⚠️ 无可淘汰的叶子（ref=0），仅能释放 ${freed} pages`);
+      break;
+    }
+    const victim = leaves[0];
+    toEvict.push(victim);
+    freed += victim.pageCount;
+    // 立即从 trie 上摘除（而不是两步走）
+    if (victim.parent) {
+      const key = victim.segments[0].name;
+      victim.parent.children.delete(key);
+    }
+    logFn('evict', `     ✗ 淘汰叶子 [${victim.displayName}] (${victim.pageCount}p, lastAccess=${victim.lastAccess})`);
+  }
+  return toEvict;
+}
+
+function finalizeEviction(toEvict) {
+  // 从 parent 拆掉
+  for (const n of toEvict) {
+    if (n.parent) {
+      const key = n.segments[0].name;
+      n.parent.children.delete(key);
+    }
+  }
+  // 触发级联淘汰：如果 parent 现在也是 ref=0 且无 children → 也可淘汰（可选）
+  // 这里保守不做级联，只清叶子
+}
+
+function maybeEvict(logFn, needPages) {
+  // 传入的 needPages 是本次插入需要的 page 总数
+  return evictForAllocation(needPages, logFn);
+}
+
+// ============================================================================
+// 布局与渲染
+// ============================================================================
+function layout() {
+  function computeWidth(n) {
+    if (n.evicting) { n._w = 0.6; return 0.6; }
+    if (n.children.size === 0) { n._w = 1; return 1; }
+    let w = 0;
+    for (const c of n.children.values()) w += computeWidth(c);
+    n._w = Math.max(w, 1);
+    return n._w;
+  }
+  computeWidth(root);
+  function assign(n, xStart, y) {
+    const w = n._w || 1;
+    n.x = xStart + w / 2;
+    n.y = y;
+    let cx = xStart;
+    for (const c of n.children.values()) {
+      const cw = c._w || 1;
+      assign(c, cx, y + 105);
+      cx += cw;
+    }
+  }
+  assign(root, 0, 40);
+}
+
+function allNodes(n = root, acc = []) {
+  acc.push(n);
+  for (const c of n.children.values()) allNodes(c, acc);
+  return acc;
+}
+
+function escapeXml(s) {
+  return String(s).replace(/[<>&]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;'}[c]));
+}
+
+function maxDepth(n, d = 0) {
+  if (n.children.size === 0) return d;
+  let m = d;
+  for (const c of n.children.values()) m = Math.max(m, maxDepth(c, d + 1));
+  return m;
+}
+
+// ---------- 状态快照 / 恢复（用于「上一步」）----------
+function snapshot() {
+  const nodesMap = new Map();
+  function walk(n) {
+    nodesMap.set(n.id, {
+      id: n.id,
+      segments: JSON.parse(JSON.stringify(n.segments)),
+      childKeys: [...n.children.keys()],
+      childIds: [...n.children.values()].map(c => c.id),
+      parentId: n.parent ? n.parent.id : null,
+      refCount: n.refCount,
+      state: n.state,
+      lastAccess: n.lastAccess,
+      evicting: n.evicting,
+    });
+    for (const c of n.children.values()) walk(c);
+  }
+  walk(root);
+  const sessSnap = [];
+  for (const [k, v] of sessions.entries()) sessSnap.push([k, {leafId: v.leaf ? v.leaf.id : null, active: v.active, prompt: v.prompt}]);
+  return {
+    rootId: root.id,
+    nodesMap: [...nodesMap.entries()],
+    sessions: sessSnap,
+    nodeIdCounter,
+    accessClock,
+    currentStep,
+  };
+}
+
+function restore(snap) {
+  nodeIdCounter = snap.nodeIdCounter;
+  accessClock = snap.accessClock;
+  currentStep = snap.currentStep;
+
+  // 重建所有 Node 对象
+  const idToNode = new Map();
+  for (const [id, data] of snap.nodesMap) {
+    const n = Object.create(Node.prototype);
+    n.id = data.id;
+    n.segments = JSON.parse(JSON.stringify(data.segments));
+    n.children = new Map();
+    n.parent = null;
+    n.refCount = data.refCount;
+    n.state = data.state;
+    n.lastAccess = data.lastAccess;
+    n.evicting = data.evicting;
+    idToNode.set(id, n);
+  }
+  // 重建 parent / children 引用
+  for (const [id, data] of snap.nodesMap) {
+    const n = idToNode.get(id);
+    if (data.parentId !== null) n.parent = idToNode.get(data.parentId);
+    for (let i = 0; i < data.childKeys.length; i++) {
+      n.children.set(data.childKeys[i], idToNode.get(data.childIds[i]));
+    }
+  }
+  root = idToNode.get(snap.rootId);
+  sessions = new Map();
+  for (const [uid, v] of snap.sessions) {
+    sessions.set(uid, {
+      leaf: v.leafId !== null ? idToNode.get(v.leafId) : null,
+      active: v.active,
+      prompt: v.prompt,
+    });
+  }
+}
+
+// ---------- Diff：计算前后两个快照的变化 ----------
+function diffSnapshots(prev, cur) {
+  if (!prev) return { added: [], removed: [], refChanged: [] };
+  const prevIds = new Set(prev.nodesMap.map(([id]) => id));
+  const curIds = new Set(cur.nodesMap.map(([id]) => id));
+  const added = [...curIds].filter(id => !prevIds.has(id));
+  const removed = [...prevIds].filter(id => !curIds.has(id));
+  const refChanged = [];
+  const prevMap = new Map(prev.nodesMap);
+  const curMap = new Map(cur.nodesMap);
+  for (const id of curIds) {
+    if (!prevIds.has(id)) continue;
+    if (prevMap.get(id).refCount !== curMap.get(id).refCount) {
+      refChanged.push({
+        id,
+        from: prevMap.get(id).refCount,
+        to: curMap.get(id).refCount,
+        name: curMap.get(id).segments.map(s => s.name).join('|') || 'root',
+      });
+    }
+  }
+  return { added, removed, refChanged };
+}
+
+function summarizeDiff(diff) {
+  const parts = [];
+  if (diff.added.length > 0) parts.push(`+${diff.added.length} 节点`);
+  if (diff.removed.length > 0) parts.push(`−${diff.removed.length} 节点`);
+  if (diff.refChanged.length > 0) {
+    const upCount = diff.refChanged.filter(c => c.to > c.from).length;
+    const dnCount = diff.refChanged.filter(c => c.to < c.from).length;
+    if (upCount > 0) parts.push(`ref↑ ${upCount}处`);
+    if (dnCount > 0) parts.push(`ref↓ ${dnCount}处`);
+  }
+  return parts.length > 0 ? parts.join('，') : '无变化';
+}
+
+// ---------- 主树渲染 ----------
+function render(justSplitNode = null) {
+  layout();
+  const svg = document.getElementById('tree');
+  const nodes = allNodes();
+  const totalW = Math.max(root._w || 1, 1);
+  const nodeSlot = 165;
+  const width = Math.max(1200, totalW * nodeSlot);
+  const height = Math.max(500, 60 + 105 * (maxDepth(root) + 1));
+  svg.setAttribute('width', width);
+  svg.setAttribute('height', height);
+  const scale = (width - 100) / totalW;
+  const offsetX = 50;
+
+  let parts = [];
+  for (const n of nodes) {
+    if (n === root || !n.parent) continue;
+    const x1 = n.parent.x * scale + offsetX;
+    const y1 = n.parent.y + 24;
+    const x2 = n.x * scale + offsetX;
+    const y2 = n.y - 24;
+    const cls = n.evicting || n.parent.evicting ? 'link evicting' : 'link';
+    parts.push(`<line class="${cls}" x1="${x1.toFixed(1)}" y1="${y1}" x2="${x2.toFixed(1)}" y2="${y2}"/>`);
+  }
+  for (const n of nodes) {
+    const x = n.x * scale + offsetX;
+    const y = n.y;
+    let stateCls;
+    if (n === root) stateCls = 'state-normal';
+    else if (n.evicting) stateCls = 'state-evicting';
+    else if (n.state === 'split-parent') stateCls = 'state-split-parent';
+    else stateCls = 'state-' + n.state;
+    const flashCls = (n === justSplitNode) ? ' flashing' : '';
+    const dn = n.displayName;
+    const displayName = dn.length > 22 ? dn.slice(0, 19) + '...' : dn;
+    const line2 = n === root ? '(entry)' :
+      `${n.tokenCount}t · ${n.pageCount}p · ref=${n.refCount}`;
+    parts.push(`<g class="node">
+      <rect x="${(x-72).toFixed(1)}" y="${y-24}" width="144" height="52" rx="6" class="${stateCls}${flashCls}"/>
+      <text class="title" x="${x.toFixed(1)}" y="${y-6}">${escapeXml(displayName)}</text>
+      <text x="${x.toFixed(1)}" y="${y+11}" fill="#666">${line2}</text>
+    </g>`);
+  }
+  svg.innerHTML = parts.join('');
+
+  // 统计
+  document.getElementById('stat-nodes').textContent = nodes.filter(n => n !== root && !n.evicting).length;
+  const activeNodes = nodes.filter(n => !n.evicting);
+  const totalTokens = activeNodes.reduce((a, n) => a + n.tokenCount, 0);
+  const totalPages = currentPageUsage();
+  const saved = activeNodes.reduce((a, n) => a + n.pageCount * Math.max(n.refCount - 1, 0), 0);
+  document.getElementById('stat-tokens').textContent = totalTokens.toLocaleString();
+  document.getElementById('stat-pages').textContent = totalPages.toLocaleString();
+  document.getElementById('stat-saved').textContent = saved.toLocaleString();
+
+  const pct = Math.min(100, Math.round(totalPages / POOL_CAP * 100));
+  document.getElementById('pool-fill').style.width = pct + '%';
+  document.getElementById('pool-label').textContent = `${totalPages} / ${POOL_CAP} pages (${pct}%)`;
+
+  // 会话列表
+  const sessDiv = document.getElementById('sessions');
+  const rows = [];
+  for (const [uid, s] of sessions.entries()) {
+    const cls = s.active ? '' : 'ended';
+    const dn = s.leaf ? s.leaf.displayName : '?';
+    rows.push(`<div class="session-row ${cls}">
+      <span class="session-tag">${uid}</span>
+      <span style="color:#666">→ ${dn.length > 22 ? dn.slice(0, 19) + '...' : dn}</span>
+    </div>`);
+  }
+  sessDiv.innerHTML = rows.join('') || '<div style="color:#999;font-size:11px">（暂无会话）</div>';
+}
+
+// ============================================================================
+// 演示脚本 — 强化 Split 与淘汰
+// ============================================================================
+const script = [
+  // === 阶段 1：先建初始树，触发多层 split ===
+  { kind: 'insert', user: 'U1', badge: 'b-insert', desc: '📥 U1 首次请求（已完成 2 轮对话）',
+    hint: '空树，直接挂第一条完整 path（含两轮完整 QA）',
+    prompt: [{name:'system', c:32}, {name:'Q_A1', c:16}, {name:'A_A1', c:32}, {name:'Q_A2', c:16}, {name:'A_A2', c:48}] },
+
+  { kind: 'insert', user: 'U2', badge: 'b-split', desc: '📥 U2 加入（相同 system，完成 1 轮）',
+    hint: '⚡ SPLIT #1：从长条 path 里拆出 system 段',
+    prompt: [{name:'system', c:32}, {name:'Q_B1', c:16}, {name:'A_B1', c:32}] },
+
+  { kind: 'insert', user: 'U3', badge: 'b-split', desc: '📥 U3：与 U1 共享到 A_A1，然后分叉',
+    hint: '⚡ SPLIT #2：在 U1 的 [Q_A2|A_A2] 那一大段前头拆开',
+    prompt: [{name:'system', c:32}, {name:'Q_A1', c:16}, {name:'A_A1', c:32}, {name:'Q_C', c:16}, {name:'A_C', c:32}] },
+
+  { kind: 'insert', user: 'U4', badge: 'b-insert', desc: '📥 U4 与 U3 完全相同 prompt',
+    hint: '沿路径纯命中，ref 沿路累加，不触发 split',
+    prompt: [{name:'system', c:32}, {name:'Q_A1', c:16}, {name:'A_A1', c:32}, {name:'Q_C', c:16}, {name:'A_C', c:32}] },
+
+  { kind: 'insert', user: 'U5', badge: 'b-split', desc: '📥 U5 深度 split 场景',
+    hint: '⚡ SPLIT #3：跟 U3/U4 共享到 A_A1，再在 Q_C 内部拆开',
+    prompt: [{name:'system', c:32}, {name:'Q_A1', c:16}, {name:'A_A1', c:32}, {name:'Q_E', c:16}, {name:'A_E', c:16}] },
+
+  // === 阶段 2：制造更多 split ===
+  { kind: 'insert', user: 'U6', badge: 'b-split', desc: '📥 U6 从 U2 分支后 split',
+    hint: '⚡ SPLIT #4：跟 U2 共享到 A_B1，另立分支',
+    prompt: [{name:'system', c:32}, {name:'Q_B1', c:16}, {name:'A_B1', c:32}, {name:'Q_F', c:16}, {name:'A_F', c:16}] },
+
+  { kind: 'insert', user: 'U7', badge: 'b-split', desc: '📥 U7 触发 4 层深处 split',
+    hint: '⚡ SPLIT #5：跟 U6 共享到 A_B1，然后叉',
+    prompt: [{name:'system', c:32}, {name:'Q_B1', c:16}, {name:'A_B1', c:32}, {name:'Q_G', c:16}, {name:'A_G', c:16}] },
+
+  // === 阶段 3：会话结束 → ref 递减 ===
+  { kind: 'end', user: 'U1', badge: 'b-end', desc: '🚪 U1 会话结束',
+    hint: '沿路径 ref-- 但节点还在（可能被其他会话共享）' },
+
+  { kind: 'end', user: 'U2', badge: 'b-end', desc: '🚪 U2 会话结束',
+    hint: '继续减引用，system 节点 ref 从 7→6' },
+
+  // === 阶段 4：加剧内存压力 → 淘汰 ===
+  { kind: 'insert', user: 'U8', badge: 'b-insert', desc: '📥 U8 上线（长 prompt 加重内存压力）',
+    hint: '生成较大新节点，观察 Pool 用量',
+    prompt: [{name:'system', c:32}, {name:'Q_H', c:100}, {name:'A_H', c:350}, {name:'Q_H2', c:80}, {name:'A_H2', c:300}] },
+
+  { kind: 'insert', user: 'U9', badge: 'b-insert', desc: '📥 U9 上线（继续加压）',
+    hint: '插入新长分支',
+    prompt: [{name:'system', c:32}, {name:'Q_I', c:150}, {name:'A_I', c:400}] },
+
+  { kind: 'end', user: 'U3', badge: 'b-end', desc: '🚪 U3 结束（准备腾出可淘汰节点）',
+    hint: '让某些叶子 ref 降到 0，变可淘汰' },
+
+  { kind: 'end', user: 'U5', badge: 'b-end', desc: '🚪 U5 结束',
+    hint: 'Q_E 分支 ref 归 0 → 变可淘汰候选' },
+
+  { kind: 'end', user: 'U7', badge: 'b-end', desc: '🚪 U7 结束',
+    hint: 'Q_G 分支 ref 归 0' },
+
+  { kind: 'insert', user: 'U10', badge: 'b-evict', desc: '📥 U10 上线，Pool 超阈值 → LRU 淘汰',
+    hint: '⚠️ Pool > 80%，触发 evict：优先剪最老的 ref=0 叶子',
+    prompt: [{name:'sys_v2', c:500}, {name:'Q_J', c:100}, {name:'A_J', c:300}, {name:'Q_J2', c:80}, {name:'A_J2', c:250}] },
+
+  { kind: 'end', user: 'U4', badge: 'b-end', desc: '🚪 U4 结束',
+    hint: '让 U3/U4 曾共享的 Q_C+A_C 节点 ref 归 0' },
+
+  { kind: 'insert', user: 'U11', badge: 'b-evict', desc: '📥 U11 大 prompt 上线',
+    hint: '⚠️ 继续制造淘汰：更多 ref=0 叶子被清理',
+    prompt: [{name:'sys_v3', c:600}, {name:'Q_K', c:150}, {name:'A_K', c:500}] },
+];
+
+// ============================================================================
+// 播放控制
+// ============================================================================
+let currentStep = 0;
+let autoTimer = null;
+let pendingEviction = null;   // 淘汰会分两步显示
+let history = [];             // 每步之前的状态快照（含 tree + sessions + step 描述）
+
+function log(kind, msg) {
+  const div = document.getElementById('log');
+  const el = document.createElement('div');
+  el.className = 'entry ' + kind;
+  el.textContent = msg;
+  div.appendChild(el);
+  div.scrollTop = div.scrollHeight;
+}
+
+function formatPrompt(segs) {
+  return '[' + segs.map(s => `${s.name}(${s.c}t)`).join(' + ') + ']';
+}
+
+function updateCurrentStep(step, idx) {
+  const el = document.getElementById('current-step');
+  let promptStr = '';
+  if (step.prompt) promptStr = formatPrompt(step.prompt);
+  const badgeText = step.kind === 'insert' ? (step.badge === 'b-split' ? 'SPLIT 预期' : (step.badge === 'b-evict' ? '触发淘汰' : '插入')) :
+                   step.kind === 'end' ? '会话结束' : '';
+  el.innerHTML = `
+    <div class="step-index">Step ${idx + 1} / ${script.length}
+      <span class="step-badge ${step.badge}">${badgeText}</span>
+    </div>
+    <div class="step-desc">${step.desc}</div>
+    <div class="step-prompt">${step.hint || ''}${promptStr ? '<br>' + promptStr : ''}</div>
+  `;
+}
+
+function findLatestSplitParent() {
+  const nodes = allNodes();
+  return nodes.find(n => n.state === 'split-parent') || null;
+}
+
+// 估算 promptSegs 在当前 trie 上能命中多少 pages
+function estimateMatched(promptSegs) {
+  let cur = root;
+  let remaining = [...promptSegs];
+  let matched = 0;
+  while (remaining.length > 0) {
+    const child = cur.children.get(remaining[0].name);
+    if (!child) break;
+    let matchIdx = 0;
+    while (matchIdx < child.segments.length &&
+           matchIdx < remaining.length &&
+           child.segments[matchIdx].name === remaining[matchIdx].name) {
+      matchIdx++;
+    }
+    if (matchIdx === 0) break;
+    matched += child.segments.slice(0, matchIdx).reduce((a, s) => a + Math.ceil(s.count/16), 0);
+    if (matchIdx < child.segments.length) break;
+    cur = child;
+    remaining = remaining.slice(matchIdx);
+  }
+  return matched;
+}
+
+function nextStep() {
+  if (currentStep >= script.length) {
+    log('step', '✅ 全部步骤完成');
+    document.getElementById('btn-next').disabled = true;
+    if (autoTimer) stopAuto();
+    return;
+  }
+  const step = script[currentStep];
+
+  // 保存当前状态到 history
+  const before = snapshot();
+  history.push({ before, step: {...step, __idx: currentStep} });
+  document.getElementById('btn-back').disabled = false;
+
+  updateCurrentStep(step, currentStep);
+  log('step', `━━━ Step ${currentStep + 1}: ${step.desc} ━━━`);
+
+  if (step.kind === 'insert') {
+    const promptSegs = step.prompt.map(s => ({name: s.name, count: s.c}));
+    log('match', `  ⟶ ${step.user} prompt: ${formatPrompt(step.prompt)}`);
+
+    // 估算本次需要分配的 page 总数（已命中部分不需新 page）
+    const totalPages = promptSegs.reduce((a,s) => a + Math.ceil(s.count/16), 0);
+    const matched = estimateMatched(promptSegs);
+    const needAlloc = totalPages - matched;
+    log('match', `  估算：总需 ${totalPages}p，命中 ${matched}p，需新分配 ${needAlloc}p`);
+
+    // 按需 evict
+    maybeEvict(log, needAlloc);
+    // 淘汰后再检查：如果仍不够，跳过本次插入（对齐源码：_allocate assert 失败）
+    const usedAfterEvict = currentPageUsage();
+    if (usedAfterEvict + needAlloc > POOL_CAP) {
+      log('evict', `  ⚠️ Pool 不足且无可淘汰叶子，${step.user} 被拒接（源码：request 入 waiting queue）`);
+      currentStep++;
+      if (currentStep === script.length) document.getElementById('btn-next').disabled = true;
+      return;
+    }
+    const leaf = insertPath(promptSegs, log);
+    sessions.set(step.user, { leaf, active: true, prompt: step.prompt });
+    render(findLatestSplitParent());
+  } else if (step.kind === 'end') {
+    endSession(step.user, log);
+    render();
+  }
+  currentStep++;
+
+  // 保存 after 快照，计算 diff
+  const after = snapshot();
+  history[history.length - 1].after = after;
+  const diff = diffSnapshots(before, after);
+  const diffSummary = summarizeDiff(diff);
+  log('step', `  📊 本步变化: ${diffSummary}`);
+
+  if (currentStep === script.length && (!pendingEviction || pendingEviction.length === 0)) {
+    document.getElementById('btn-next').disabled = true;
+  }
+}
+
+function goBack() {
+  if (history.length === 0) return;
+  stopAuto();
+  const last = history.pop();
+  restore(last.before);
+  pendingEviction = null;
+
+  log('step', `↩ 回退到 Step ${last.step.__idx} 之前（撤销：${last.step.desc}）`);
+
+  // 更新 current-step 提示
+  if (history.length === 0) {
+    document.getElementById('current-step').innerHTML = `
+      <div class="step-index">已回到初始状态</div>
+      <div class="step-desc">点击「下一步」继续</div>
+      <div class="step-prompt"></div>
+    `;
+    document.getElementById('btn-back').disabled = true;
+  } else {
+    const prev = history[history.length - 1];
+    updateCurrentStep(prev.step, prev.step.__idx);
+  }
+
+  document.getElementById('btn-next').disabled = false;
+  render();
+}
+
+function reset() {
+  stopAuto();
+  resetTree();
+  currentStep = 0;
+  pendingEviction = null;
+  history = [];
+  document.getElementById('btn-next').disabled = false;
+  document.getElementById('btn-back').disabled = true;
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('current-step').innerHTML = `
+    <div class="step-index">准备就绪</div>
+    <div class="step-desc">点击「下一步」开始</div>
+    <div class="step-prompt"></div>
+  `;
+  render();
+}
+
+function startAuto() {
+  const btn = document.getElementById('btn-auto');
+  btn.textContent = '⏸ 暂停';
+  const speed = parseInt(document.getElementById('speed').value);
+  nextStep();
+  autoTimer = setInterval(() => {
+    if (currentStep >= script.length && (!pendingEviction || pendingEviction.length === 0)) {
+      stopAuto();
+    } else nextStep();
+  }, speed);
+}
+function stopAuto() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = null;
+  document.getElementById('btn-auto').textContent = '▶ 自动播放';
+}
+function toggleAuto() {
+  if (autoTimer) stopAuto(); else startAuto();
+}
+
+document.getElementById('btn-next').addEventListener('click', nextStep);
+document.getElementById('btn-back').addEventListener('click', goBack);
+document.getElementById('btn-reset').addEventListener('click', reset);
+document.getElementById('btn-auto').addEventListener('click', toggleAuto);
+document.getElementById('speed').addEventListener('input', e => {
+  document.getElementById('speed-label').textContent = (e.target.value / 1000).toFixed(1) + 's';
+  if (autoTimer) { stopAuto(); startAuto(); }
+});
+
+resetTree();
+reset();
+</script>
+</body>
+</html>

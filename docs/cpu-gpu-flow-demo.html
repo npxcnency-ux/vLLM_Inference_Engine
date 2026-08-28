@@ -1,0 +1,1243 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>SGLang CPU/GPU 数据结构与数据流</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    padding: 12px;
+    background: #f5f7fa;
+    color: #333;
+    font-size: 13px;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  h1 { margin: 0 0 4px 0; font-size: 19px; flex-shrink: 0; }
+  .subtitle { color: #666; font-size: 12px; margin-bottom: 8px; flex-shrink: 0; }
+
+  .top {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 12px;
+    flex: 1;
+    min-height: 0;   /* 关键：让 grid 子项能受 flex 高度控制，自己滚动 */
+  }
+  .control-panel {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .current-step {
+    background: linear-gradient(135deg, #fff9e0 0%, #fff5c9 100%);
+    border: 1px solid #f0c040;
+    padding: 8px 10px;
+    border-radius: 6px;
+    min-height: 90px;
+    margin-bottom: 8px;
+  }
+  .step-index { color: #999; font-size: 11px; }
+  .step-desc { font-weight: bold; margin: 4px 0; font-size: 13px; }
+  .step-hint { color: #666; font-size: 11px; line-height: 1.5; }
+
+  .controls button {
+    display: block;
+    width: 100%;
+    padding: 8px;
+    margin: 3px 0;
+    border: 1px solid #ccc;
+    background: #fafafa;
+    border-radius: 5px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: all 0.15s;
+  }
+  .controls button:hover { background: #eee; }
+  .controls button.primary { background: #007aff; color: white; border-color: #007aff; }
+  .controls button.primary:hover { background: #0060cc; }
+  .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .speed-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 12px; color: #666; }
+  .speed-row input { flex: 1; }
+
+  .flow-container {
+    background: #fff;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 10px;
+    position: relative;
+    min-height: 0;
+    overflow: hidden;
+  }
+  .cpu-gpu-divider {
+    position: absolute;
+    left: 42%;
+    top: 40px;
+    bottom: 12px;
+    width: 2px;
+    background: repeating-linear-gradient(
+      to bottom,
+      #ccc 0, #ccc 6px, transparent 6px, transparent 12px
+    );
+    transform: translateX(-50%);
+  }
+  .zone-label {
+    position: absolute;
+    top: 8px;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-weight: bold;
+    font-size: 12px;
+    letter-spacing: 1px;
+  }
+  .zone-label.cpu {
+    left: 12px;
+    background: #dbeafe;
+    color: #1e40af;
+    border: 1px solid #93c5fd;
+  }
+  .zone-label.gpu {
+    right: 12px;
+    background: #fce7f3;
+    color: #9d174d;
+    border: 1px solid #f9a8d4;
+  }
+
+  .zone { position: absolute; top: 40px; bottom: 12px; padding: 8px; overflow-y: auto; }
+  .zone.cpu { left: 10px; right: 59%; }
+  .zone.gpu { left: 43%; right: 10px; }
+
+  .ds-card {
+    background: #fafafa;
+    border: 1.5px solid #ddd;
+    border-radius: 6px;
+    padding: 7px 9px;
+    margin-bottom: 6px;
+    transition: all 0.4s;
+    position: relative;
+  }
+  .ds-card.cpu { background: #f0f6ff; border-color: #90c2ff; }
+  .ds-card.gpu { background: #fff0f6; border-color: #ffb3d1; }
+  .ds-card.highlight {
+    box-shadow: 0 0 0 3px rgba(255, 165, 0, 0.4);
+    transform: scale(1.02);
+  }
+  .ds-card.highlight-write {
+    box-shadow: 0 0 0 3px rgba(50, 200, 50, 0.4);
+  }
+  .ds-card .ds-title {
+    font-size: 11px;
+    font-weight: bold;
+    color: #444;
+    margin-bottom: 4px;
+    display: flex;
+    justify-content: space-between;
+  }
+  .ds-card .ds-title .ds-type {
+    font-weight: normal;
+    color: #999;
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 10px;
+  }
+  .ds-card .ds-content { font-family: 'SF Mono', Menlo, monospace; font-size: 11px; line-height: 1.5; }
+
+  /* pending_list rows */
+  .pending-row {
+    padding: 3px 6px;
+    background: #fff;
+    border: 1px solid #d0d7de;
+    border-radius: 3px;
+    margin: 2px 0;
+    display: flex;
+    justify-content: space-between;
+    animation: slideIn 0.4s;
+  }
+  .pending-row.new { background: #d4f0d4; border-color: #2a9d2a; }
+  @keyframes slideIn {
+    from { opacity: 0; transform: translateX(-8px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+
+  /* chip row */
+  .chip-row {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(38px, 1fr));
+    gap: 3px;
+    align-items: center;
+  }
+  .chip {
+    padding: 2px 4px;
+    background: #e0e7ff;
+    border: 1px solid #a5b4fc;
+    border-radius: 3px;
+    font-size: 10px;
+    font-family: 'SF Mono', monospace;
+    transition: all 0.35s;
+    white-space: nowrap;
+    text-align: center;
+  }
+  .chip.taken { background: #ffe4e6; border-color: #fda4af; text-decoration: line-through; opacity: 0.4; }
+  .chip.just-taken { background: #fef3c7; border-color: #fbbf24; animation: pulse 0.5s ease-in-out 2; }
+  .chip.gpu-free { background: #fce7f3; border-color: #f9a8d4; }
+  @keyframes pulse { 50% { transform: scale(1.15); } }
+
+  /* radix tree as vertical layout */
+  .tree-mini { padding: 6px; }
+  .node-mini {
+    display: inline-block;
+    padding: 3px 8px;
+    margin: 2px;
+    background: #fff;
+    border: 1.5px solid #666;
+    border-radius: 4px;
+    font-family: 'SF Mono', monospace;
+    font-size: 10px;
+    line-height: 1.3;
+    transition: all 0.4s;
+  }
+  .node-mini.shared { background: #fff2cc; border-color: #d68000; }
+  .node-mini.highlight { box-shadow: 0 0 0 3px rgba(255,165,0,0.4); }
+  .node-mini.new { background: #d4f0d4; border-color: #2a9d2a; }
+  .node-mini .n-title { font-weight: bold; }
+  .node-mini .n-ref { color: #d68000; font-size: 9px; margin-left: 4px; }
+  .node-mini .n-tensor {
+    display: block; font-size: 8px; color: #cc0088;
+    background: #fff0f6; padding: 1px 3px; border-radius: 2px; margin-top: 2px;
+  }
+  .tree-level {
+    text-align: center;
+    padding: 3px 0;
+    position: relative;
+  }
+  .tree-level::after {
+    content: '';
+    display: block;
+    height: 8px;
+    background-image: linear-gradient(to bottom, transparent, transparent 3px, #bbb 3px, #bbb 4px, transparent 4px);
+  }
+  .tree-level.leaf::after { display: none; }
+
+  /* page_table as matrix */
+  .matrix {
+    display: inline-block;
+    font-family: 'SF Mono', monospace;
+    font-size: 10px;
+    line-height: 1.2;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  .matrix table { border-collapse: collapse; }
+  .matrix td {
+    border: 1px solid #ccc;
+    padding: 2px 4px;
+    text-align: center;
+    min-width: 32px;
+    background: #fff;
+    transition: all 0.35s;
+    font-size: 9.5px;
+  }
+  .matrix td.empty { color: #ddd; background: #f8f8f8; }
+  .matrix td.written { background: #fef3c7; }
+  .matrix td.recent-write { background: #86efac; animation: pulse 0.5s; }
+  .matrix td.reused { background: #ffd6a5; }
+  .matrix .row-label { font-weight: bold; color: #666; background: #f0f0f0; }
+  .matrix .col-label { color: #999; background: #f8f8f8; font-size: 9px; }
+
+  /* KV pool: grid */
+  .pool-viz {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(30px, 1fr));
+    gap: 2px;
+    padding: 3px;
+    border: 1px solid #ccc;
+    border-radius: 3px;
+    background: #fafafa;
+  }
+  .pool-cell {
+    height: 20px;
+    background: #f3f4f6;
+    border: 1px solid #eee;
+    border-radius: 2px;
+    transition: all 0.35s;
+    position: relative;
+    font-size: 9px;
+    color: #666;
+    text-align: center;
+    line-height: 18px;
+  }
+  .pool-cell:last-child { border-right: none; }
+  .pool-cell.used { background: #a5f3fc; color: #164e63; font-weight: bold; }
+  .pool-cell.recent-alloc { background: #86efac; animation: pulse 0.5s; }
+  .pool-cell.reused { background: #fed7aa; }
+
+  /* Active Reqs */
+  .req-card {
+    background: #f0fdf4;
+    border: 1px solid #86efac;
+    border-radius: 4px;
+    padding: 4px 6px;
+    margin: 3px 0;
+    font-size: 10px;
+    font-family: 'SF Mono', monospace;
+    animation: slideIn 0.4s;
+  }
+  .req-card.finished { opacity: 0.3; text-decoration: line-through; }
+  .req-card .req-fields { color: #666; margin-top: 2px; font-size: 9px; }
+
+  /* Animated flow particle */
+  .particle {
+    position: absolute;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: #ffd700;
+    box-shadow: 0 0 10px #ffd700;
+    pointer-events: none;
+    z-index: 100;
+  }
+
+  #log {
+    overflow-y: auto;
+    font-family: 'SF Mono', Menlo, monospace;
+    font-size: 10.5px;
+    background: #1e1e1e;
+    color: #e0e0e0;
+    padding: 8px 10px;
+    line-height: 1.55;
+    margin: 0;
+    border-radius: 0;
+  }
+  #log .entry { padding: 1px 0; }
+  #log .entry.step { color: #ffd700; margin-top: 4px; padding: 3px 5px; background: #333; border-radius: 3px; }
+  #log .entry.cpu { color: #70b0ff; }
+  #log .entry.gpu { color: #ff90b0; }
+  #log .entry.arrow { color: #a8a8a8; }
+
+  .stats-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 4px;
+    margin-top: 8px;
+    font-size: 10px;
+  }
+  .mini-stat {
+    background: #f0f4f8;
+    padding: 4px 6px;
+    border-radius: 4px;
+    text-align: center;
+  }
+  .mini-stat .n { display: block; font-size: 14px; font-weight: bold; color: #007aff; }
+  .mini-stat.gpu-stat .n { color: #d946ef; }
+</style>
+</head>
+<body>
+
+<h1>SGLang CPU / GPU 数据结构 · 数据流动画</h1>
+<div class="subtitle">
+  演示一次请求的完整生命周期，展示 <b class="cpu-label">CPU 侧控制平面</b> 和 <b class="gpu-label">GPU 侧数据平面</b> 各数据结构如何协作。
+  以 mini-sglang 源码为准（<code>python/minisgl/</code>）。<b>page_size=16, num_pages=100, max_running_reqs=12 (源码默认 256), 淘汰策略=按需(分配缺量时才 evict)</b>。请求序列与 <a href="radix-tree-demo.html">radix-tree-demo.html</a> 完全对齐。
+</div>
+
+<!-- <div style="background:#fff4e0;border:1px solid #f0a040;border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:12px;line-height:1.55">
+  <b>⚠️ 两个同名但完全不同的 <code>free_slots</code>，别混：</b><br>
+  <span style="color:#1e40af">🔵 <b>TableManager._free_slots</b></span> — CPU 侧 Python list，存「空闲的 req 行号」（0~max_reqs-1）。
+  <span style="color:#9d174d">🟣 <b>CacheManager.free_slots</b></span> — GPU 侧 int32 tensor，存「空闲 page 的 token 起始位置」。
+</div> -->
+
+<div class="top">
+  <div class="control-panel">
+    <div class="current-step" id="current-step">
+      <div class="step-index">准备就绪</div>
+      <div class="step-desc">点击「下一步」开始</div>
+      <div class="step-hint"></div>
+    </div>
+    <div class="controls">
+      <button id="btn-next" class="primary">下一步 →</button>
+      <button id="btn-back">↩ 上一步</button>
+      <button id="btn-auto">▶ 自动播放</button>
+      <button id="btn-reset">↻ 重置</button>
+      <div class="speed-row">
+        <span>速度</span>
+        <input type="range" id="speed" min="800" max="4500" step="200" value="2200">
+        <span id="speed-label">2.2s</span>
+      </div>
+    </div>
+    <div class="stats-row">
+      <div class="mini-stat">活跃 Reqs<span class="n" id="stat-active">0</span></div>
+      <div class="mini-stat">Trie 节点<span class="n" id="stat-nodes">0</span></div>
+      <div class="mini-stat gpu-stat">已用 pages<span class="n" id="stat-used">0</span></div>
+      <div class="mini-stat gpu-stat">空闲 pages<span class="n" id="stat-free">8</span></div>
+    </div>
+
+    <div style="margin-top:10px;background:#1e1e1e;border-radius:6px;overflow:hidden;flex:1;min-height:0;display:flex;flex-direction:column">
+      <div style="color:#ccc;background:#2a2a2a;padding:6px 10px;font-size:12px;font-weight:bold;flex-shrink:0">📜 执行日志</div>
+      <div id="log" style="flex:1;min-height:0;max-height:none"></div>
+    </div>
+  </div>
+
+  <div class="flow-container" id="flow">
+    <div class="cpu-gpu-divider"></div>
+    <div class="zone-label cpu">CPU  · 控制平面 (Python objects)</div>
+    <div class="zone-label gpu">GPU · 数据平面 (torch.Tensor)</div>
+
+    <div class="zone cpu">
+      <div class="ds-card cpu" id="ds-pending">
+        <div class="ds-title">PrefillManager.pending_list<span class="ds-type">List[PendingReq]</span></div>
+        <div class="ds-content" id="pending-body"><span style="color:#aaa">(empty)</span></div>
+      </div>
+
+      <div class="ds-card cpu" id="ds-table-free">
+        <div class="ds-title">🔵 TableManager._free_slots<span class="ds-type">List[int]  # 空闲 req 行号</span></div>
+        <div class="ds-content"><div class="chip-row" id="table-free-body"></div></div>
+      </div>
+
+      <div class="ds-card cpu" id="ds-tree">
+        <div class="ds-title">RadixPrefixCache.root_node<span class="ds-type">Trie 骨架 (Python dict/指针)</span></div>
+        <div class="ds-content"><div class="tree-mini" id="tree-body"></div></div>
+      </div>
+
+      <div class="ds-card cpu" id="ds-active">
+        <div class="ds-title">活跃 Reqs<span class="ds-type">Req(uid, table_idx, cached_len, device_len, cache_handle)</span></div>
+        <div class="ds-content" id="active-body" style="max-height:280px;overflow-y:auto"><span style="color:#aaa">(none)</span></div>
+      </div>
+    </div>
+
+    <div class="zone gpu">
+      <div class="ds-card gpu" id="ds-kv-free">
+        <div class="ds-title">🟣 CacheManager.free_slots<span class="ds-type">torch.int32 tensor  # 空闲 page 的 token 起始位置</span></div>
+        <div class="ds-content"><div class="chip-row" id="kv-free-body"></div></div>
+      </div>
+
+      <div class="ds-card gpu" id="ds-page-table">
+        <div class="ds-title">page_table<span class="ds-type">shape=(max_reqs, max_seq_len)</span></div>
+        <div class="ds-content"><div class="matrix" id="page-table-body"></div></div>
+      </div>
+
+      <div class="ds-card gpu" id="ds-token-pool">
+        <div class="ds-title">token_pool<span class="ds-type">同 shape，存 int32 token_id（hover 看演示标签）</span></div>
+        <div class="ds-content"><div class="matrix" id="token-pool-body"></div></div>
+      </div>
+
+      <div class="ds-card gpu" id="ds-kv-pool">
+        <div class="ds-title">KV pool<span class="ds-type">shape=(2, L, num_pages, page_size, kv_heads, head_dim)</span></div>
+        <div class="ds-content"><div class="pool-viz" id="kv-pool-body"></div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+
+
+<script>
+// ============================================================================
+// SGLang CPU/GPU flow demo — 请求序列对齐 radix-tree-demo.html
+// 参数放大以容纳 radix-tree 里的 11 个用户
+// ============================================================================
+const NUM_PAGES = 100;              // KV pool 里 page 数（10 U 场景容易触发 evict）
+const PAGE_SIZE = 16;               // 每 page 16 token（对齐 radix-tree-demo）
+const MAX_REQS = 12;                // 最多同时活跃 req 数（mini-sglang 默认 256，演示取 12）
+const MAX_SEQ_LEN = 24;             // page_table 列数
+
+// 演示脚本：完全对齐 radix-tree-demo.html 的序列
+// c 是该段的 token 数（与 radix-tree-demo 一致），插入时按 ceil(c/PAGE_SIZE) 换算为 page 数
+// 前 7 个 U 采用较小 prompt，保证 Pool 不满；U8-U11 用大 prompt 启用 evict
+const script = [
+  { kind:'insert', user:'U1', badge:'insert', title:'📥 U1 首次请求（已完成 2 轮对话）',
+    hint:'空 trie，直接挂第一条完整 path（system+Q_A1+A_A1+Q_A2+A_A2）',
+    segs:[{name:'system',c:32}, {name:'Q_A1',c:16}, {name:'A_A1',c:32}, {name:'Q_A2',c:16}, {name:'A_A2',c:48}] },
+
+  { kind:'insert', user:'U2', badge:'split', title:'📥 U2 加入（相同 system，完成 1 轮）',
+    hint:'⚡ SPLIT #1：从 U1 长条 path 里拆出 system 段',
+    segs:[{name:'system',c:32}, {name:'Q_B1',c:16}, {name:'A_B1',c:32}] },
+
+  { kind:'insert', user:'U3', badge:'split', title:'📥 U3：与 U1 共享到 A_A1，然后分叉',
+    hint:'⚡ SPLIT #2：在 U1 的 [Q_A2|A_A2] 前拆开',
+    segs:[{name:'system',c:32}, {name:'Q_A1',c:16}, {name:'A_A1',c:32}, {name:'Q_C',c:16}, {name:'A_C',c:32}] },
+
+  { kind:'insert', user:'U4', badge:'insert', title:'📥 U4 与 U3 完全相同 prompt',
+    hint:'路径纯命中，ref 沿路累加，不触发 split',
+    segs:[{name:'system',c:32}, {name:'Q_A1',c:16}, {name:'A_A1',c:32}, {name:'Q_C',c:16}, {name:'A_C',c:32}] },
+
+  { kind:'insert', user:'U5', badge:'split', title:'📥 U5 深度 split 场景',
+    hint:'⚡ SPLIT #3：跟 U3/U4 共享到 A_A1，再另立分支',
+    segs:[{name:'system',c:32}, {name:'Q_A1',c:16}, {name:'A_A1',c:32}, {name:'Q_E',c:16}, {name:'A_E',c:16}] },
+
+  { kind:'insert', user:'U6', badge:'split', title:'📥 U6 从 U2 分支后 split',
+    hint:'⚡ SPLIT #4：跟 U2 共享到 A_B1，另立分支',
+    segs:[{name:'system',c:32}, {name:'Q_B1',c:16}, {name:'A_B1',c:32}, {name:'Q_F',c:16}, {name:'A_F',c:16}] },
+
+  { kind:'insert', user:'U7', badge:'split', title:'📥 U7 触发 4 层深处 split',
+    hint:'⚡ SPLIT #5：跟 U6 共享到 A_B1，然后叉',
+    segs:[{name:'system',c:32}, {name:'Q_B1',c:16}, {name:'A_B1',c:32}, {name:'Q_G',c:16}, {name:'A_G',c:16}] },
+
+  { kind:'end', user:'U1', badge:'end', title:'🚪 U1 会话结束',
+    hint:'沿路径 ref-- 但节点还在' },
+
+  { kind:'end', user:'U2', badge:'end', title:'🚪 U2 会话结束',
+    hint:'继续减引用' },
+
+  { kind:'insert', user:'U8', badge:'insert', title:'📥 U8 上线（长 prompt 加重内存压力）',
+    hint:'生成较大新节点',
+    segs:[{name:'system',c:32}, {name:'Q_H',c:100}, {name:'A_H',c:350}, {name:'Q_H2',c:80}, {name:'A_H2',c:300}] },
+
+  { kind:'insert', user:'U9', badge:'insert', title:'📥 U9 上线（继续加压）',
+    hint:'插入新长分支',
+    segs:[{name:'system',c:32}, {name:'Q_I',c:150}, {name:'A_I',c:400}] },
+
+  { kind:'end', user:'U3', badge:'end', title:'🚪 U3 结束',
+    hint:'让某些叶子 ref 降到 0，变可淘汰' },
+
+  { kind:'end', user:'U5', badge:'end', title:'🚪 U5 结束',
+    hint:'Q_E/A_E 分支 ref 归 0' },
+
+  { kind:'end', user:'U7', badge:'end', title:'🚪 U7 结束',
+    hint:'Q_G/A_G 分支 ref 归 0' },
+
+  { kind:'insert', user:'U10', badge:'evict', title:'📥 U10 上线，Pool 可能不够 → LRU 淘汰',
+    hint:'⚠️ 如 Pool 不够，按需 evict（最老的 ref=0 叶子优先）',
+    segs:[{name:'sys_v2',c:500}, {name:'Q_J',c:100}, {name:'A_J',c:300}, {name:'Q_J2',c:80}, {name:'A_J2',c:250}] },
+
+  { kind:'end', user:'U4', badge:'end', title:'🚪 U4 结束',
+    hint:'让 U3/U4 曾共享的 Q_C+A_C 节点 ref 归 0' },
+
+  { kind:'insert', user:'U11', badge:'evict', title:'📥 U11 大 prompt 上线',
+    hint:'⚠️ 继续制造淘汰',
+    segs:[{name:'sys_v3',c:600}, {name:'Q_K',c:150}, {name:'A_K',c:500}] },
+];
+
+// 将 segment 的 token 数转为 page 数（与 mini-sglang 一致：向上取整）
+function segPages(seg) { return Math.ceil(seg.c / PAGE_SIZE); }
+// 汇总 segments 所需的 page 总数
+function totalSegPages(segs) { return segs.reduce((a, s) => a + segPages(s), 0); }
+
+// ============================================================================
+// State
+// ============================================================================
+let state;
+
+function initState() {
+  state = {
+    pending: [],
+    tableFree: Array.from({length: MAX_REQS}, (_, i) => i),
+    kvFree: Array.from({length: NUM_PAGES}, (_, i) => i),   // page id 数组
+    pageTable: Array.from({length: MAX_REQS}, () => Array(MAX_SEQ_LEN).fill(null)),
+    tokenPool: Array.from({length: MAX_REQS}, () => Array(MAX_SEQ_LEN).fill(null)),
+    // trie 节点：{id, segs:[{name,c}], value:[page_id,...], refCount, parent, children, timestamp}
+    trie: { nextId: 1, root: {id:0, segs:[], value:[], refCount:1, parent:null, children:{}, timestamp:0} },
+    activeReqs: [],  // {uid, tableIdx, leaf, segs, pages}
+    kvPoolOwner: Array(NUM_PAGES).fill(null),   // page → uid（"占用者"）
+    freedRows: new Set(),                       // 已归还但未清零的 table_idx
+    clock: 0,
+  };
+}
+
+// ============================================================================
+// Trie 操作（简化：按 segment 名做 key，同 radix-tree-demo）
+// ============================================================================
+function insertTree(segs, allocatedPages, uid) {
+  state.clock++;
+  let cur = state.trie.root;
+  let remaining = [...segs];
+  let allocIdx = 0;
+  let leaf = state.trie.root;
+
+  while (remaining.length > 0) {
+    const first = remaining[0].name;
+    const child = cur.children[first];
+
+    if (!child) {
+      // 新节点
+      const totalPages = totalSegPages(remaining);
+      const value = allocatedPages.slice(allocIdx, allocIdx + totalPages);
+      allocIdx += totalPages;
+      const n = {
+        id: state.trie.nextId++,
+        segs: remaining,
+        value: value,
+        refCount: 1,
+        parent: cur,
+        children: {},
+        timestamp: state.clock,
+        __new: true,
+      };
+      cur.children[first] = n;
+      logMsg('cpu', `  ✚ 新增 trie 节点 [${remaining.map(s=>s.name).join('|')}] value=[${value.join(',')}] ref=1`);
+      leaf = n;
+      break;
+    }
+
+    // 有 child，找共同 segment 数
+    let matchIdx = 0;
+    while (matchIdx < child.segs.length &&
+           matchIdx < remaining.length &&
+           child.segs[matchIdx].name === remaining[matchIdx].name) {
+      matchIdx++;
+    }
+
+    if (matchIdx === child.segs.length) {
+      // 完全命中 child
+      child.refCount++;
+      child.timestamp = state.clock;
+      child.__matched = true;
+      logMsg('cpu', `  ↓ 命中 [${child.segs.map(s=>s.name).join('|')}] value=[${child.value.join(',')}] ref=${child.refCount}`);
+      remaining = remaining.slice(matchIdx);
+      cur = child;
+      leaf = child;
+    } else {
+      // 部分匹配 → SPLIT
+      const common = child.segs.slice(0, matchIdx);
+      const commonPages = totalSegPages(child.segs.slice(0, matchIdx));
+      const childRest = child.segs.slice(matchIdx);
+
+      const parentValue = child.value.slice(0, commonPages);
+      const childRestValue = child.value.slice(commonPages);
+
+      const parent = {
+        id: state.trie.nextId++,
+        segs: common,
+        value: parentValue,
+        refCount: child.refCount + 1,   // +U 新 req
+        parent: cur,
+        children: {},
+        timestamp: state.clock,
+        __split: true,
+      };
+      cur.children[first] = parent;
+
+      child.segs = childRest;
+      child.value = childRestValue;
+      child.parent = parent;
+      parent.children[childRest[0].name] = child;
+
+      const newRest = remaining.slice(matchIdx);
+      if (newRest.length > 0) {
+        const newRestPages = totalSegPages(newRest);
+        const value = allocatedPages.slice(allocIdx, allocIdx + newRestPages);
+        allocIdx += newRestPages;
+        const nb = {
+          id: state.trie.nextId++,
+          segs: newRest,
+          value: value,
+          refCount: 1,
+          parent: parent,
+          children: {},
+          timestamp: state.clock,
+          __new: true,
+        };
+        parent.children[newRest[0].name] = nb;
+        leaf = nb;
+      } else {
+        leaf = parent;
+      }
+
+      logMsg('split', `  ⚡ SPLIT！拆出共享父 [${common.map(s=>s.name).join('|')}] value=[${parentValue.join(',')}] ref=${parent.refCount}`);
+      logMsg('split', `     原节点后半 [${childRest.map(s=>s.name).join('|')}] value=[${childRestValue.join(',')}] ref=${child.refCount}`);
+      break;
+    }
+  }
+  return leaf;
+}
+
+function findMatchInfo(segs) {
+  // 返回 {cachedPageCount, matchedLeaf 或 null, needAllocPages}
+  let cur = state.trie.root;
+  let remaining = [...segs];
+  let cachedPages = 0;
+  let cachedTokens = 0;
+  const totalPages = totalSegPages(segs);
+
+  while (remaining.length > 0) {
+    const child = cur.children[remaining[0].name];
+    if (!child) break;
+    let matchIdx = 0;
+    while (matchIdx < child.segs.length &&
+           matchIdx < remaining.length &&
+           child.segs[matchIdx].name === remaining[matchIdx].name) {
+      matchIdx++;
+    }
+    if (matchIdx === 0) break;
+    const matchPages = totalSegPages(child.segs.slice(0, matchIdx));
+    cachedPages += matchPages;
+    cachedTokens += matchPages * PAGE_SIZE;
+    if (matchIdx < child.segs.length) break;  // 匹配到 child 中间就停
+    cur = child;
+    remaining = remaining.slice(matchIdx);
+  }
+  return { cachedPages, cachedTokens, needAlloc: totalPages - cachedPages };
+}
+
+function endSession(uid) {
+  const req = state.activeReqs.find(r => r.uid === uid && !r.finished);
+  if (!req) return;
+  req.finished = true;
+  state.clock++;
+  // 沿路径 ref--
+  let cur = req.leaf;
+  const path = [];
+  while (cur && cur.parent) { path.push(cur); cur = cur.parent; }
+  for (const n of path) {
+    n.refCount = Math.max(0, n.refCount - 1);
+    n.__refDown = true;
+    n.timestamp = state.clock;  // touch
+  }
+  logMsg('cpu', `  ✗ ${uid} 结束，沿路径 ref-- (共 ${path.length} 个节点)`);
+  // 归还 table_idx
+  state.tableFree.unshift(req.tableIdx);
+  logMsg('cpu', `  TableManager.free(${req.tableIdx}) → 🔵_free_slots 归还`);
+  // 标记这一行为“已归还，内容保留但将被新请求覆盖”
+  // 源码里 page_table/token_pool 不主动清零，新 req 来时直接覆盖
+  state.freedRows = state.freedRows || new Set();
+  state.freedRows.add(req.tableIdx);
+  logMsg('arrow', `  page_table[${req.tableIdx}] / token_pool[${req.tableIdx}] 旧数据保留，等待新请求覆盖（源码不主动清零）`);
+}
+
+// LRU 淘汰（对齐 mini-sglang: CacheManager._allocate）
+// 只在分配时空闲不够才触发，只淘汰所缺量。
+function evictForAllocation(needed) {
+  const shortage = needed - state.kvFree.length;
+  if (shortage <= 0) return [];
+  logMsg('evict', `  ▼ 需 ${needed} pages，仅剩 ${state.kvFree.length}，需 evict ${shortage} pages`);
+  const evicted = [];
+  let freed = 0;
+
+  while (freed < shortage) {
+    // 收集所有 ref=0 的叶子
+    const leaves = [];
+    function walk(n) {
+      if (n.parent && Object.keys(n.children).length === 0 && n.refCount === 0) leaves.push(n);
+      for (const k in n.children) walk(n.children[k]);
+    }
+    walk(state.trie.root);
+    if (leaves.length === 0) {
+      logMsg('evict', `  ⚠️ 无可淘汰的叶子（所有节点都被活跃 req 锁住）`);
+      break;
+    }
+    leaves.sort((a,b) => a.timestamp - b.timestamp);
+    const victim = leaves[0];
+    for (const p of victim.value) {
+      state.kvFree.push(p);
+      state.kvPoolOwner[p] = null;
+    }
+    freed += victim.value.length;
+    evicted.push({name: victim.segs.map(s=>s.name).join('|'), pages: [...victim.value]});
+    const firstName = victim.segs[0].name;
+    delete victim.parent.children[firstName];
+    logMsg('evict', `  ✗ 淘汰叶子 [${victim.segs.map(s=>s.name).join('|')}] 释放 pages=[${victim.value.join(',')}]`);
+  }
+  return evicted;
+}
+
+// ============================================================================
+// 执行一步
+// ============================================================================
+// 将 insert 拆为两个小步：1) 入 pending  2) 消费 pending
+function enqueuePending(step) {
+  state.pending.push({uid: step.user, __new: true, segs: step.segs});
+  logMsg('cpu', `  📥 PrefillManager.add_one_req → pending_list.append(${step.user})`);
+  logMsg('arrow', `     → 现在 pending_list: [${state.pending.map(p=>p.uid).join(', ')}]`);
+  logMsg('arrow', `     下一步 scheduler 会从 pending 中取出它、分配资源、插入 trie`);
+}
+
+function consumePending(step) {
+  // 清理上一步的临时标记
+  function clearFlags(n) {
+    delete n.__new; delete n.__matched; delete n.__split; delete n.__refDown;
+    for (const k in n.children) clearFlags(n.children[k]);
+  }
+  clearFlags(state.trie.root);
+  state.__justAllocated = null;
+  state.__reusedPages = null;
+
+  // 从 pending 弹出
+  const idx = state.pending.findIndex(p => p.uid === step.user);
+  if (idx >= 0) state.pending.splice(idx, 1);
+
+  // 分配 table_idx
+  if (state.tableFree.length === 0) {
+    logMsg('cpu', `  ⚠️ 无空闲 table_idx，跳过 ${step.user}`);
+    return;
+  }
+  const tableIdx = state.tableFree.shift();
+  const wasReclaimed = state.freedRows && state.freedRows.has(tableIdx);
+  if (wasReclaimed) {
+    logMsg('arrow', `  ♻️ table_idx=${tableIdx} 是之前归还的行，将被 ${step.user} 覆盖`);
+    state.freedRows.delete(tableIdx);
+    for (let c = 0; c < MAX_SEQ_LEN; c++) {
+      state.pageTable[tableIdx][c] = null;
+      state.tokenPool[tableIdx][c] = null;
+      if (state.tokenPoolLabel) state.tokenPoolLabel[tableIdx][c] = null;
+    }
+  }
+  logMsg('cpu', `  🔵 TableManager.allocate() → table_idx=${tableIdx}`);
+
+  const info = findMatchInfo(step.segs);
+  logMsg('cpu', `  match_prefix → cached ${info.cachedPages} pages, 需分配 ${info.needAlloc} pages`);
+
+  if (state.kvFree.length < info.needAlloc) {
+    evictForAllocation(info.needAlloc);
+  }
+  if (state.kvFree.length < info.needAlloc) {
+    logMsg('cpu', `  ⚠️ Pool 不足，即使淘汰后也不够！`);
+    state.tableFree.unshift(tableIdx);
+    return;
+  }
+  const allocated = state.kvFree.splice(0, info.needAlloc);
+  state.__justAllocated = [...allocated];
+  for (const p of allocated) state.kvPoolOwner[p] = step.user;
+  logMsg('gpu', `  🟣 CacheManager.free_slots 切 ${info.needAlloc} 个 → 分配 pages=[${allocated.join(',')}]`);
+  logMsg('arrow', `  🔍 U${step.user}: total=${totalSegPages(step.segs)}p, cached=${info.cachedPages}p, alloc=${info.needAlloc}p → pool now has ${NUM_PAGES - state.kvFree.length}/${NUM_PAGES} used`);
+
+  const cachedPagesList = collectCachedPages(step.segs);
+  state.__reusedPages = [...cachedPagesList];
+  const leaf = insertTree(step.segs, allocated, step.user);
+  const allPages = [...cachedPagesList, ...allocated];
+
+  let col = 0;
+  for (const seg of step.segs) {
+    const segPageCount = segPages(seg);
+    for (let i = 0; i < segPageCount; i++) {
+      if (col < MAX_SEQ_LEN) {
+        state.pageTable[tableIdx][col] = allPages[col];
+        state.tokenPool[tableIdx][col] = mockTokenId(seg.name, i);
+        state.tokenPoolLabel = state.tokenPoolLabel || Array.from({length: MAX_REQS}, () => Array(MAX_SEQ_LEN).fill(null));
+        state.tokenPoolLabel[tableIdx][col] = seg.name;
+      }
+      col++;
+    }
+  }
+  logMsg('gpu', `  page_table[${tableIdx}][0:${col}] ← [${allPages.slice(0, col).join(',')}]`);
+  if (cachedPagesList.length > 0) {
+    logMsg('gpu', `     其中 ${cachedPagesList.length} 页复用了 trie 里的 KV（零拷贝）`);
+  }
+
+  const cachedLen = info.cachedPages * PAGE_SIZE;
+  const deviceLen = step.segs.reduce((a, s) => a + s.c, 0);
+  state.activeReqs.push({
+    uid: step.user, tableIdx, cachedLen, deviceLen,
+    cacheHandle: leaf, leaf, segs: step.segs, pages: allPages, finished: false,
+  });
+}
+
+function executeStep(step) {
+  // 清理上一步的临时标记
+  function clearFlags(n) {
+    delete n.__new; delete n.__matched; delete n.__split; delete n.__refDown;
+    for (const k in n.children) clearFlags(n.children[k]);
+  }
+  clearFlags(state.trie.root);
+  state.__justAllocated = null;
+  state.__reusedPages = null;
+
+  if (step.kind === 'end') {
+    endSession(step.user);
+  }
+}
+
+// 沿路径收集命中的 page 列表（沿 trie walk 一次拿全）
+function collectCachedPages(segs) {
+  let cur = state.trie.root;
+  let remaining = [...segs];
+  const result = [];
+  while (remaining.length > 0) {
+    const child = cur.children[remaining[0].name];
+    if (!child) break;
+    let matchIdx = 0;
+    while (matchIdx < child.segs.length &&
+           matchIdx < remaining.length &&
+           child.segs[matchIdx].name === remaining[matchIdx].name) matchIdx++;
+    if (matchIdx === 0) break;
+    const matchPages = totalSegPages(child.segs.slice(0, matchIdx));
+    result.push(...child.value.slice(0, matchPages));
+    if (matchIdx < child.segs.length) break;
+    cur = child;
+    remaining = remaining.slice(matchIdx);
+  }
+  return result;
+}
+
+// ============================================================================
+// 渲染
+// ============================================================================
+function renderPending() {
+  const el = document.getElementById('pending-body');
+  if (state.pending.length === 0) { el.innerHTML = '<span style="color:#aaa">(empty)</span>'; return; }
+  el.innerHTML = state.pending.map(p =>
+    `<div class="pending-row ${p.__new ? 'new' : ''}">
+       <span>${p.uid}</span>
+       <span style="color:#666">${p.segs.length} segs</span>
+     </div>`
+  ).join('');
+  state.pending.forEach(p => p.__new = false);
+}
+
+function renderTableFree() {
+  const el = document.getElementById('table-free-body');
+  const chips = [];
+  for (let i = 0; i < MAX_REQS; i++) {
+    const taken = !state.tableFree.includes(i);
+    chips.push(`<span class="chip ${taken ? 'taken' : ''}">${i}</span>`);
+  }
+  el.innerHTML = chips.join('');
+}
+
+// 模拟产生一个合理的 token id（Qwen 词表 151936，演示里用符号名哈希到 100000-150000 区间）
+function mockTokenId(segName, offsetInSeg) {
+  let h = 0;
+  for (let i = 0; i < segName.length; i++) h = ((h << 5) - h + segName.charCodeAt(i)) | 0;
+  return 100000 + (Math.abs(h + offsetInSeg * 137) % 50000);
+}
+
+function renderKvFree() {
+  const el = document.getElementById('kv-free-body');
+  const chips = [];
+  // 展示全部 NUM_PAGES 个 page，多行 grid 布局
+  for (let p = 0; p < NUM_PAGES; p++) {
+    const inFree = state.kvFree.includes(p);
+    const justAlloc = state.__justAllocated?.includes(p);
+    const cls = ['chip', 'gpu-free'];
+    if (!inFree) cls.push('taken');
+    if (justAlloc) cls.push('just-taken');
+    chips.push(`<span class="${cls.join(' ')}">${p}</span>`);
+  }
+  el.innerHTML = chips.join('');
+}
+
+function renderPageTable() {
+  const el = document.getElementById('page-table-body');
+  let html = '<table><tr><td class="col-label">idx</td>';
+  for (let c = 0; c < MAX_SEQ_LEN; c++) html += `<td class="col-label">${c}</td>`;
+  html += '</tr>';
+  const freed = state.freedRows || new Set();
+  for (let r = 0; r < MAX_REQS; r++) {
+    const isFreed = freed.has(r);
+    const rowLabel = isFreed ? `req${r} 🕒` : `req${r}`;
+    const rowStyle = isFreed ? 'style="opacity:0.4"' : '';
+    html += `<tr ${rowStyle}><td class="row-label" title="${isFreed ? '已归还，内容待覆盖' : ''}">${rowLabel}</td>`;
+    for (let c = 0; c < MAX_SEQ_LEN; c++) {
+      const v = state.pageTable[r][c];
+      const isReuse = v !== null && state.__reusedPages?.includes(v);
+      const isRecent = v !== null && state.__justAllocated?.includes(v);
+      const cls = v === null ? 'empty' :
+                  isRecent ? 'recent-write' :
+                  isReuse ? 'reused' : 'written';
+      html += `<td class="${cls}">${v === null ? '·' : v}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+function renderTokenPool() {
+  const el = document.getElementById('token-pool-body');
+  let html = '<table><tr><td class="col-label">idx</td>';
+  for (let c = 0; c < MAX_SEQ_LEN; c++) html += `<td class="col-label">${c}</td>`;
+  html += '</tr>';
+  const freed = state.freedRows || new Set();
+  for (let r = 0; r < MAX_REQS; r++) {
+    const isFreed = freed.has(r);
+    const rowLabel = isFreed ? `req${r} 🕒` : `req${r}`;
+    const rowStyle = isFreed ? 'style="opacity:0.4"' : '';
+    html += `<tr ${rowStyle}><td class="row-label" title="${isFreed ? '已归还，内容待覆盖' : ''}">${rowLabel}</td>`;
+    for (let c = 0; c < MAX_SEQ_LEN; c++) {
+      const v = state.tokenPool[r][c];
+      const label = state.tokenPoolLabel?.[r]?.[c] || '';
+      const title = v === null ? '' : `token_id=${v}\u000a(演示标签: ${label})`;
+      html += `<td class="${v === null ? 'empty' : 'written'}" title="${title}">${v === null ? '·' : v}</td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</table>';
+  el.innerHTML = html;
+}
+
+function renderKvPool() {
+  const el = document.getElementById('kv-pool-body');
+  const cells = [];
+  // 全量展示 NUM_PAGES 个 page，多行 grid
+  for (let p = 0; p < NUM_PAGES; p++) {
+    const owner = state.kvPoolOwner[p];
+    const recent = state.__justAllocated?.includes(p);
+    const reused = state.__reusedPages?.includes(p);
+    const cls = owner ? (recent ? 'recent-alloc' : (reused ? 'reused' : 'used')) : '';
+    const label = owner ? p : `${p}`;
+    const title = owner || 'free';
+    cells.push(`<div class="pool-cell ${cls}" title="page ${p}: ${title}">${label}</div>`);
+  }
+  el.innerHTML = cells.join('');
+}
+
+function renderTree() {
+  const el = document.getElementById('tree-body');
+  const levels = [];
+  function walk(n, depth) {
+    if (!levels[depth]) levels[depth] = [];
+    levels[depth].push(n);
+    for (const k in n.children) walk(n.children[k], depth + 1);
+  }
+  walk(state.trie.root, 0);
+  const html = levels.map((lvl, i) => {
+    const isLeaf = (i === levels.length - 1);
+    return `<div class="tree-level ${isLeaf ? 'leaf' : ''}">` +
+      lvl.map(n => {
+        const isRoot = n.parent === null;
+        const cls = ['node-mini'];
+        if (n.refCount > 1) cls.push('shared');
+        if (n.__matched) cls.push('highlight');
+        if (n.__new) cls.push('new');
+        const label = isRoot ? 'root' : `[${n.segs.map(s=>s.name).join('|')}]`;
+        const refInfo = isRoot ? '' : `<span class="n-ref">ref=${n.refCount}</span>`;
+        const tensor = isRoot ? '' : `<span class="n-tensor">value=[${n.value.join(',')}]</span>`;
+        return `<span class="${cls.join(' ')}"><span class="n-title">${label}${refInfo}</span>${tensor}</span>`;
+      }).join('') + '</div>';
+  }).join('');
+  el.innerHTML = html;
+}
+
+function renderActive() {
+  const el = document.getElementById('active-body');
+  const active = state.activeReqs.filter(r => !r.finished);
+  const titleEl = document.querySelector('#ds-active .ds-title');
+  if (titleEl) {
+    titleEl.innerHTML = `活跃 Reqs (${active.length})<span class="ds-type">Req(uid, table_idx, cached_len, device_len, cache_handle)</span>`;
+  }
+  if (active.length === 0) { el.innerHTML = '<span style="color:#aaa">(none)</span>'; return; }
+  el.innerHTML = active.map(r => {
+    const segNames = r.segs.map(s => s.name).join(' | ');
+    const pagesShort = r.pages.length > 8
+      ? `[${r.pages.slice(0,6).join(',')}, … (+${r.pages.length-6})]`
+      : `[${r.pages.join(',')}]`;
+    const handleInfo = r.cacheHandle ?
+      `cache_handle → node${r.cacheHandle.id} [${r.cacheHandle.segs.map(s=>s.name).join('|') || 'root'}]` :
+      'cache_handle=None';
+    return `<div class="req-card">
+       <div style="font-weight:bold;color:#0369a1">Req(uid=${r.uid})</div>
+       <div class="req-fields">table_idx=${r.tableIdx} · cached_len=${r.cachedLen} · device_len=${r.deviceLen}</div>
+       <div class="req-fields">input segments: ${segNames}</div>
+       <div class="req-fields">page_table[${r.tableIdx}] pages = ${pagesShort}</div>
+       <div class="req-fields">${handleInfo}</div>
+     </div>`;
+  }).join('');
+}
+
+function renderStats() {
+  document.getElementById('stat-active').textContent = state.activeReqs.filter(r => !r.finished).length;
+  let cnt = 0;
+  function walk(n) { if (n.parent) cnt++; for (const k in n.children) walk(n.children[k]); }
+  walk(state.trie.root);
+  document.getElementById('stat-nodes').textContent = cnt;
+  document.getElementById('stat-used').textContent = NUM_PAGES - state.kvFree.length;
+  document.getElementById('stat-free').textContent = state.kvFree.length;
+}
+
+function renderAll() {
+  renderPending(); renderTableFree(); renderKvFree();
+  renderPageTable(); renderTokenPool(); renderKvPool();
+  renderTree(); renderActive(); renderStats();
+}
+
+// ============================================================================
+// 播放控制
+// ============================================================================
+let stepIdx = 0;
+let autoTimer = null;
+let history = [];   // 快照栈（上一步回退）
+
+function logMsg(kind, msg) {
+  const div = document.getElementById('log');
+  const el = document.createElement('div');
+  el.className = 'entry ' + kind;
+  el.textContent = msg;
+  div.appendChild(el);
+  div.scrollTop = div.scrollHeight;
+}
+
+function updateCurrentStep(s, idx) {
+  const el = document.getElementById('current-step');
+  el.innerHTML = `
+    <div class="step-index">Step ${idx + 1} / ${script.length}</div>
+    <div class="step-desc">${s.title}</div>
+    <div class="step-hint">${s.hint}</div>
+  `;
+}
+
+function nextStep() {
+  // 处理子步骤：上一步只把 req 加入了 pending，本次才真正消费
+  if (state.__pendingSubStep) {
+    saveSnapshot();
+    const s = state.__pendingSubStep;
+    logMsg('step', `── (接上步) schedule_next_batch → 处理 ${s.user}`);
+    consumePending(s);
+    renderAll();
+    state.__pendingSubStep = null;
+    document.getElementById('btn-back').disabled = false;
+    if (stepIdx === script.length) document.getElementById('btn-next').disabled = true;
+    return;
+  }
+
+  if (stepIdx >= script.length) {
+    document.getElementById('btn-next').disabled = true;
+    if (autoTimer) stopAuto();
+    return;
+  }
+  saveSnapshot();
+  const s = script[stepIdx];
+  updateCurrentStep(s, stepIdx);
+  logMsg('step', `━━━ Step ${stepIdx + 1}: ${s.title} ━━━`);
+
+  // insert 拆为两个小步：先入 pending、下次才消费
+  if (s.kind === 'insert') {
+    enqueuePending(s);
+    renderAll();
+    state.__pendingSubStep = s;
+  } else {
+    executeStep(s);
+    renderAll();
+  }
+  stepIdx++;
+  document.getElementById('btn-back').disabled = false;
+  if (stepIdx === script.length && !state.__pendingSubStep) document.getElementById('btn-next').disabled = true;
+}
+
+// 保存/恢复快照（支持上一步）
+function saveSnapshot() {
+  const idMap = new Map();
+  function collect(n) {
+    idMap.set(n, {
+      id: n.id, segs: n.segs, value: [...n.value],
+      refCount: n.refCount, timestamp: n.timestamp,
+      __new: n.__new, __matched: n.__matched, __split: n.__split, __refDown: n.__refDown,
+    });
+    for (const k in n.children) collect(n.children[k]);
+  }
+  collect(state.trie.root);
+  const parentMap = [], childrenMap = [];
+  for (const [n, d] of idMap) {
+    parentMap.push([d.id, n.parent ? n.parent.id : null]);
+    childrenMap.push([d.id, Object.entries(n.children).map(([k, c]) => [k, c.id])]);
+  }
+  history.push({
+    stepIdx,
+    pending: JSON.parse(JSON.stringify(state.pending)),
+    tableFree: [...state.tableFree],
+    kvFree: [...state.kvFree],
+    pageTable: state.pageTable.map(row => [...row]),
+    tokenPool: state.tokenPool.map(row => [...row]),
+    kvPoolOwner: [...state.kvPoolOwner],
+    freedRows: state.freedRows ? [...state.freedRows] : [],
+    clock: state.clock,
+    trieNextId: state.trie.nextId,
+    nodeData: [...idMap.values()],
+    parentMap, childrenMap,
+    activeReqs: state.activeReqs.map(r => ({
+      uid: r.uid, tableIdx: r.tableIdx, cachedLen: r.cachedLen, deviceLen: r.deviceLen,
+      leafId: r.leaf ? r.leaf.id : null,
+      segs: r.segs, pages: [...r.pages], finished: r.finished,
+    })),
+    logHtml: document.getElementById('log').innerHTML,
+    currentStepHtml: document.getElementById('current-step').innerHTML,
+  });
+}
+
+function goBack() {
+  if (history.length === 0) return;
+  stopAuto();
+  const snap = history.pop();
+  stepIdx = snap.stepIdx;
+
+  const idToNode = new Map();
+  for (const d of snap.nodeData) {
+    idToNode.set(d.id, {
+      id: d.id, segs: d.segs, value: [...d.value],
+      refCount: d.refCount, timestamp: d.timestamp,
+      __new: d.__new, __matched: d.__matched, __split: d.__split, __refDown: d.__refDown,
+      parent: null, children: {},
+    });
+  }
+  for (const [id, parentId] of snap.parentMap) {
+    idToNode.get(id).parent = parentId !== null ? idToNode.get(parentId) : null;
+  }
+  for (const [id, entries] of snap.childrenMap) {
+    const n = idToNode.get(id);
+    for (const [k, cid] of entries) n.children[k] = idToNode.get(cid);
+  }
+
+  state = {
+    pending: JSON.parse(JSON.stringify(snap.pending)),
+    tableFree: [...snap.tableFree],
+    kvFree: [...snap.kvFree],
+    pageTable: snap.pageTable.map(row => [...row]),
+    tokenPool: snap.tokenPool.map(row => [...row]),
+    kvPoolOwner: [...snap.kvPoolOwner],
+    freedRows: new Set(snap.freedRows || []),
+    clock: snap.clock,
+    trie: { nextId: snap.trieNextId, root: idToNode.get(0) },
+    activeReqs: snap.activeReqs.map(r => ({
+      uid: r.uid, tableIdx: r.tableIdx, cachedLen: r.cachedLen, deviceLen: r.deviceLen,
+      leaf: r.leafId !== null ? idToNode.get(r.leafId) : null,
+      cacheHandle: r.leafId !== null ? idToNode.get(r.leafId) : null,
+      segs: r.segs, pages: [...r.pages], finished: r.finished,
+    })),
+  };
+
+  document.getElementById('log').innerHTML = snap.logHtml;
+  document.getElementById('current-step').innerHTML = snap.currentStepHtml;
+  document.getElementById('btn-next').disabled = false;
+  document.getElementById('btn-back').disabled = history.length === 0;
+  renderAll();
+}
+
+function reset() {
+  stopAuto();
+  initState();
+  stepIdx = 0;
+  history = [];
+  document.getElementById('btn-next').disabled = false;
+  document.getElementById('btn-back').disabled = true;
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('current-step').innerHTML = `
+    <div class="step-index">准备就绪</div>
+    <div class="step-desc">点击「下一步」开始</div>
+    <div class="step-hint">共 ${script.length} 步（对齐 radix-tree-demo.html 的请求序列）</div>
+  `;
+  renderAll();
+}
+
+function startAuto() {
+  document.getElementById('btn-auto').textContent = '⏸ 暂停';
+  const speed = parseInt(document.getElementById('speed').value);
+  nextStep();
+  autoTimer = setInterval(() => {
+    if (stepIdx >= script.length) stopAuto();
+    else nextStep();
+  }, speed);
+}
+function stopAuto() {
+  if (autoTimer) clearInterval(autoTimer);
+  autoTimer = null;
+  document.getElementById('btn-auto').textContent = '▶ 自动播放';
+}
+function toggleAuto() { if (autoTimer) stopAuto(); else startAuto(); }
+
+document.getElementById('btn-next').addEventListener('click', nextStep);
+document.getElementById('btn-back').addEventListener('click', goBack);
+document.getElementById('btn-reset').addEventListener('click', reset);
+document.getElementById('btn-auto').addEventListener('click', toggleAuto);
+document.getElementById('speed').addEventListener('input', e => {
+  document.getElementById('speed-label').textContent = (e.target.value / 1000).toFixed(1) + 's';
+  if (autoTimer) { stopAuto(); startAuto(); }
+});
+
+initState();
+reset();
+</script>
+
+</body>
+</html>
