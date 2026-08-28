@@ -70,9 +70,26 @@ ENABLE_SPEC="${ENABLE_SPEC:-0}"
 DRAFT_MODEL="${DRAFT_MODEL:-mlx-community/Qwen3-0.6B-4bit}"
 NUM_DRAFT_TOKENS="${NUM_DRAFT_TOKENS:-4}"
 
+# ── KV cache 量化（需要 patch 过的 mlx-lm）────────────────────────────────────
+# 效果：8bit 每 token KV 从 96KB→~51KB（省 ~50%），128K 上下文 KV 从 12GB→6.4GB。
+# 实测 decode +10-14%（长会话最明显）；e2e +7-18%。
+# ⚠️  依赖本地 patch：
+#   1) mlx_lm/server.py 加了 --kv-bits/--kv-group-size/--quantized-kv-start 参数
+#   2) mlx_lm/models/cache.py 修 QuantizedKVCache.nbytes 兼容 keys=None
+#   3) 启用后强制走 sequential path（QuantizedKVCache 缺 merge classmethod）
+#      → continuous batching 失效，但 pi 单会话场景无实际影响
+# 详见 docs/qwen3-30b-a3b-perf-tuning.md
+# 关闭量化：设置 KV_BITS=0（或空）。
+KV_BITS="${KV_BITS:-8}"
+KV_GROUP_SIZE="${KV_GROUP_SIZE:-64}"
+QUANTIZED_KV_START="${QUANTIZED_KV_START:-0}"
+
 EXTRA_ARGS=()
 if [ "$ENABLE_SPEC" = "1" ]; then
     EXTRA_ARGS+=(--draft-model "$DRAFT_MODEL" --num-draft-tokens "$NUM_DRAFT_TOKENS")
+fi
+if [ -n "$KV_BITS" ] && [ "$KV_BITS" != "0" ]; then
+    EXTRA_ARGS+=(--kv-bits "$KV_BITS" --kv-group-size "$KV_GROUP_SIZE" --quantized-kv-start "$QUANTIZED_KV_START")
 fi
 
 echo "启动 Qwen3-30B-A3B MLX server:"
@@ -84,6 +101,11 @@ else
 fi
 echo "  decode-concurrency=$DECODE_CONCURRENCY prompt-concurrency=$PROMPT_CONCURRENCY"
 echo "  prompt-cache-size=$PROMPT_CACHE_SIZE prompt-cache-bytes=$PROMPT_CACHE_BYTES"
+if [ -n "$KV_BITS" ] && [ "$KV_BITS" != "0" ]; then
+    echo "  kv-bits=$KV_BITS kv-group-size=$KV_GROUP_SIZE quantized-kv-start=$QUANTIZED_KV_START (需 patch 过的 mlx-lm)"
+else
+    echo "  kv-bits=off"
+fi
 exec mlx_lm.server \
     --model "$MODEL" \
     --host 0.0.0.0 \
